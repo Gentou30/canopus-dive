@@ -1,7 +1,7 @@
 extends Control
 
 ## 画面の流れ：TITLE →（はじめてなら おはなし）→ PLAY（階）→ REST（空気だまり）→ PLAY … → RESULT
-## ルールは Dive（dive.gd）。ここは画面づくりと演出。Dive が返す events を _run_events で順に見せる。
+## ルールは Sweep（sweep.gd）。ここは画面づくりと演出。Sweep が返す events を _run_events で順に見せる。
 
 enum { TITLE, PLAY, REST, RESULT }
 
@@ -9,8 +9,9 @@ const BGS := ["bg_shallow", "bg_mid", "bg_deep"]
 const SAVE_PATH := "user://save.cfg"
 
 var state := TITLE
-var dive: Dive
-var best := 0
+var run: Sweep
+var clears := 0        # クリアした回数（タイトルに出す）
+var best_floor := 0
 var _story_seen := false
 
 # 層（下から）：背景 → 水の演出 → 画面 → 演出の文字 → 会話
@@ -23,18 +24,17 @@ var _talk_layer: Control
 
 # PLAY の部品
 var board: Board
-var _hand_box: Control
-var _cards: Array[CardView] = []
-var _sel := -1
 var _busy := false
-var _hud := {}
+var _hud: Hud
 var _hint: RichTextLabel
-var _stash_btn: Button
-var _end_btn: Button
+var _skills := {}      # 名前 -> SkillButton
+var _lv_btn: Button
+var _lv_tween: Tween
 var _speech: PanelContainer
-var _speech_tween: Tween
-var _said_low_air := false
-var _result := {}   # 終わり方（RESULT 画面用）
+var _confirm := Vector2i(-1, -1)   # もう一度タップで実行するマス
+var _said := {}        # この階で言ったセリフ（同じことを何度も言わない）
+var _result := {}      # 終わり方（RESULT 画面用）
+var _perk_choices := []
 
 # 会話
 var _talk_lines := []
@@ -101,13 +101,15 @@ func _on_layout() -> void:
 func _load_save() -> void:
 	var cf := ConfigFile.new()
 	if cf.load(SAVE_PATH) == OK:
-		best = int(cf.get_value("run", "best", 0))
+		clears = int(cf.get_value("run", "clears", 0))
+		best_floor = int(cf.get_value("run", "best_floor", 0))
 		_story_seen = bool(cf.get_value("run", "story", false))
 
 
 func _save() -> void:
 	var cf := ConfigFile.new()
-	cf.set_value("run", "best", best)
+	cf.set_value("run", "clears", clears)
+	cf.set_value("run", "best_floor", best_floor)
 	cf.set_value("run", "story", _story_seen)
 	cf.save(SAVE_PATH)
 
@@ -129,8 +131,8 @@ func _on_layout_sizes() -> void:
 func _clear_ui() -> void:
 	for c in _ui.get_children():
 		c.queue_free()
-	_cards.clear()
-	_hud.clear()
+	_skills.clear()
+	_hud = null
 	board = null
 
 
@@ -247,7 +249,7 @@ func _show_title() -> void:
 			var wave := ch.create_tween().set_loops()
 			wave.tween_property(ch, "position:y", base_y - 10, 0.9).set_trans(Tween.TRANS_SINE).set_delay(i * 0.12)
 			wave.tween_property(ch, "position:y", base_y, 0.9).set_trans(Tween.TRANS_SINE))
-	_label("best %d" % best if best > 0 else "", 26, Vector2(0, top + 160), _ui, Color(1, 1, 1, 0.9), v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	_label(("クリア %d回" % clears) if clears > 0 else (("最高 %d階" % best_floor) if best_floor > 0 else ""), 26, Vector2(0, top + 160), _ui, Color(1, 1, 1, 0.9), v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	# ボタン
 	var bw := 360.0
 	var by := v.y - (430 if portrait else 330)
@@ -484,29 +486,29 @@ func _end_talk() -> void:
 # ───────── ラン ─────────
 
 func _start_run() -> void:
-	dive = Dive.new()
+	run = Sweep.new()
 	_start_floor()
 
 
 func _start_floor() -> void:
 	state = PLAY
-	_said_low_air = false
-	dive.start_floor()
-	var z := dive.zone()
+	_said.clear()
+	var ev := run.start_floor()
+	var z := run.floor_no - 1
 	_set_bg(BGS[z], 0.25 + z * 0.1, [1.0, 0.4, 0.0][z])
 	Audio.bgm(["shallow", "mid", "deep"][z])
 	_build_play()
+	board.pop(ev[0].cells)
 	_floor_banner()
-	if dive.floor_no % 3 == 1:
-		var trip: Array = Scenario.pick(Scenario.FLOOR_START[z])
-		_say_line(trip[0], "きゅ", trip[1], 1.2)
-	if dive.floor_no == 1:
-		_set_hint("[color=#7fe8ff]カードをタップ[/color] → [color=#7fe8ff]光ったマスをタップ[/color]で使う。光る穴が出口！")
+	var pair: Array = Scenario.pick(Scenario.FLOOR_START[z])
+	_say_line(pair[0], "きゅ", pair[1], 1.4)
+	if run.floor_no == 1:
+		_set_hint("[color=#7fe8ff]光るマスをタップ[/color]で照らす。数字＝[b]まわり8マスの敵の強さの合計[/b]")
 
 
 func _floor_banner() -> void:
 	var v := _view()
-	var z := dive.zone()
+	var z := run.floor_no - 1
 	var box := Control.new()
 	box.position = Vector2(-v.x, v.y * 0.38)
 	box.size = Vector2(v.x, 150)
@@ -518,7 +520,7 @@ func _floor_banner() -> void:
 	band.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	box.add_child(band)
 	_label("%s　%s" % Scenario.ZONES[z], 54, Vector2(0, 14), box, UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("%d階　・　深さ %dm" % [dive.floor_no, dive.depth_m()], 32, Vector2(0, 90), box, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("%d階　・　深さ %dm" % [run.floor_no, run.floor_no * 120], 32, Vector2(0, 90), box, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	var tw := box.create_tween()
 	tw.tween_property(box, "position:x", 0.0, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 	tw.tween_interval(1.0)
@@ -527,144 +529,98 @@ func _floor_banner() -> void:
 	Audio.sfx("dive")
 
 
-## 画面の向きに合わせて、盤・情報・手札の位置を決める
+## 画面の向きに合わせて、盤・情報・技ボタンの位置を決める
 func _layout() -> Dictionary:
 	var v := _view()
 	if Screen.portrait:
-		var cs: float = min((v.x - 40) / Dive.W, (v.y - 520) / Dive.H)
-		var bw := cs * Dive.W
-		var by := 136.0
-		var hand_y := by + cs * Dive.H + 74
-		return {"cs": cs, "board": Vector2((v.x - bw) / 2, by), "hud": Rect2(12, 8, v.x - 24, 118),
-			"hint": Rect2(12, by + cs * Dive.H + 12, v.x - 24, 56), "hand": Rect2(10, hand_y, v.x - 20, 200),
-			"bar": Rect2(12, v.y - 84, v.x - 24, 76), "speech": Vector2(v.x / 2, by + 14)}
-	var cs2: float = min((v.y - 48) / Dive.H, (v.x - 760) / Dive.W)
-	var bx := 24.0
-	var right := bx + cs2 * Dive.W + 40
+		var cs: float = min((v.x - 24) / Sweep.W, (v.y - 360) / Sweep.H)
+		var bw := cs * Sweep.W
+		var by := 162.0
+		var bottom := by + cs * Sweep.H
+		return {"cs": cs, "board": Vector2((v.x - bw) / 2, by), "hud": Rect2(10, 8, v.x - 20, 144),
+			"hint": Rect2(10, bottom + 12, v.x - 20, 58), "skills": Rect2(10, bottom + 80, v.x - 20, v.y - bottom - 88),
+			"speech": Vector2(v.x / 2, by + 10)}
+	var cs2: float = min((v.y - 40) / Sweep.H, (v.x - 700) / Sweep.W)
+	var right := 24 + cs2 * Sweep.W + 36
 	var rw := v.x - right - 20
-	return {"cs": cs2, "board": Vector2(bx, 24), "hud": Rect2(right, 16, rw, 118),
-		"hint": Rect2(right, 146, rw, 70), "hand": Rect2(right, v.y - 300, rw, 200),
-		"bar": Rect2(right, v.y - 92, rw, 76), "speech": Vector2(right + rw / 2, 236)}
+	return {"cs": cs2, "board": Vector2(24, 20), "hud": Rect2(right, 16, rw, 144),
+		"hint": Rect2(right, 172, rw, 78), "skills": Rect2(right, v.y - 190, rw, 176),
+		"speech": Vector2(right + rw / 2, 270)}
 
 
 func _build_play() -> void:
 	_clear_ui()
-	_sel = -1
+	_confirm = Vector2i(-1, -1)
 	var L := _layout()
-	var v := _view()
 	board = Board.new()
 	board.position = L.board
 	_ui.add_child(board)
-	board.setup(dive, L.cs)
+	board.setup(run, L.cs)
 	board.cell_tapped.connect(_on_cell)
-	# 何もない所をタップしたら選択を外す
-	var catcher := Control.new()
-	catcher.size = v
-	catcher.mouse_filter = Control.MOUSE_FILTER_STOP
-	catcher.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed:
-			_select(-1))
-	_ui.add_child(catcher)
-	_ui.move_child(catcher, 0)
-	_build_hud(L.hud)
-	# ヒント（選んだカードの説明など）
-	var hp := _panel(L.hint, _ui, Color(0.5, 0.85, 1.0, 0.6), Color(0.02, 0.07, 0.15, 0.82))
+	_hud = Hud.new()
+	_hud.position = L.hud.position
+	_hud.size = L.hud.size
+	_hud.game = self
+	_ui.add_child(_hud)
+	# レベルアップのボタン（たまったら光る）
+	_lv_btn = _button("Lv UP!", _on_level_up, 26, Color(0.85, 0.55, 0.1))
+	_lv_tween = null
+	_lv_btn.size = Vector2(150, 64)
+	_lv_btn.position = L.hud.position + Vector2(L.hud.size.x - 162, L.hud.size.y - 72)
+	_ui.add_child(_lv_btn)
+	var hp_panel := _panel(L.hint, _ui, Color(0.5, 0.85, 1.0, 0.6), Color(0.02, 0.07, 0.15, 0.82))
 	_hint = RichTextLabel.new()
 	_hint.bbcode_enabled = true
-	_hint.position = Vector2(14, 8)
-	_hint.size = L.hint.size - Vector2(28, 12)
-	_hint.add_theme_font_size_override("normal_font_size", 22)
+	_hint.position = Vector2(14, 6)
+	_hint.size = L.hint.size - Vector2(28, 10)
+	_hint.add_theme_font_size_override("normal_font_size", 21)
+	_hint.add_theme_font_size_override("bold_font_size", 21)
 	_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_hint.scroll_active = false
-	hp.add_child(_hint)
-	_stash_btn = _button("ミラにあずける（元気1）", _on_stash, 22, Color(0.75, 0.35, 0.6))
-	_stash_btn.size = Vector2(300, 52)
-	_stash_btn.position = L.hint.position + Vector2(L.hint.size.x - 306, L.hint.size.y - 4)
-	_stash_btn.visible = false
-	_stash_btn.z_index = 5
-	_ui.add_child(_stash_btn)
-	# 手札
-	_hand_box = Control.new()
-	_hand_box.position = L.hand.position
-	_hand_box.size = L.hand.size
-	_hand_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_ui.add_child(_hand_box)
-	# 下のバー：山札・捨て札・元気・ターン終了
-	var bar: Rect2 = L.bar
-	_hud.deck = _label("", 22, bar.position + Vector2(0, 6), _ui, Color(0.85, 0.92, 1))
-	_hud.energy = _label("", 34, bar.position + Vector2(bar.size.x * 0.3, 12), _ui, UiStyle.AQUA)
-	_end_btn = _button("ターン終了", _on_end_turn, 30, Color(0.85, 0.4, 0.2))
-	_end_btn.size = Vector2(230, 70)
-	_end_btn.position = bar.position + Vector2(bar.size.x - 230, 2)
-	_ui.add_child(_end_btn)
+	hp_panel.add_child(_hint)
+	# 技と持ち物
+	var r: Rect2 = L.skills
+	var specs := [["sonar", "音波", UiStyle.AQUA], ["mira", "ミラのカン", UiStyle.PINK], ["memo", "メモ", Color(1, 0.6, 0.3)],
+		["pearl", "真珠", Color(1, 0.95, 0.9)], ["bottle", "空気の結晶", UiStyle.AIR]]
+	var bw := (r.size.x - 8 * (specs.size() - 1)) / specs.size()
+	var bh: float = min(r.size.y, bw * 1.25)
+	for i in specs.size():
+		var sb := SkillButton.new()
+		sb.id = specs[i][0]
+		sb.title = specs[i][1]
+		sb.color = specs[i][2]
+		sb.position = r.position + Vector2(i * (bw + 8), r.size.y - bh)
+		sb.size = Vector2(bw, bh)
+		sb.pressed.connect(_on_skill)
+		_ui.add_child(sb)
+		_skills[sb.id] = sb
 	_speech = null
 	_refresh()
-	_rebuild_hand(false)
-
-
-func _build_hud(r: Rect2) -> void:
-	_panel(r, _ui, Color(0.5, 0.85, 1.0, 0.6), Color(0.02, 0.07, 0.15, 0.82))
-	var z := dive.zone()
-	_hud.depth = _label("", 26, r.position + Vector2(16, 8), _ui, UiStyle.GOLD)
-	_hud.treasure = _label("", 26, r.position + Vector2(r.size.x - 236, 8), _ui, UiStyle.GOLD, 220, HORIZONTAL_ALIGNMENT_RIGHT)
-	var g := Gauges.new()
-	g.position = r.position + Vector2(14, 50)
-	g.size = Vector2(r.size.x - 28, 60)
-	g.game = self
-	_ui.add_child(g)
-	_hud.gauges = g
-	# 何階まで来たか（9つの丸）
-	var dots := DepthDots.new()
-	dots.position = r.position + Vector2(r.size.x * 0.42, 12)
-	dots.size = Vector2(r.size.x * 0.22, 24)
-	dots.game = self
-	_ui.add_child(dots)
 
 
 func _refresh() -> void:
-	if dive == null or board == null:
+	if run == null or board == null:
 		return
-	var z := dive.zone()
-	_hud.depth.text = "%s %d階" % [Scenario.ZONES[z][0], dive.floor_no]
-	var bag_txt := "  ミラ%d" % dive.bag.size() if dive.bag.size() > 0 else ""
-	_hud.treasure.text = "宝 %d%s" % [dive.carried_value(), bag_txt]
-	_hud.gauges.queue_redraw()
-	_hud.deck.text = "山札 %d\n捨て札 %d" % [dive.deck.size(), dive.discard.size()]
-	_hud.energy.text = "元気 " + "●".repeat(dive.energy) + "○".repeat(max(Dive.ENERGY - dive.energy, 0))
-	_end_btn.disabled = _busy
-	board.sync_visibility()
-
-
-func _rebuild_hand(deal: bool) -> void:
-	for c in _cards:
-		c.queue_free()
-	_cards.clear()
-	var n := dive.hand.size()
-	if n == 0:
-		return
-	var area := _hand_box.size
-	var cw: float = min(area.x / 5.0 - 8, 138)
-	var ch := cw * 1.45
-	var step: float = min(cw + 8, (area.x - cw) / max(n - 1, 1))
-	var total := step * (n - 1) + cw
-	var x0 := (area.x - total) / 2
-	for i in n:
-		var cv := CardView.new(dive.hand[i])
-		cv.index = i
-		cv.size = Vector2(cw, ch)
-		cv.position = Vector2(x0 + i * step, area.y - ch)
-		cv.playable = dive.can_play(i) or dive.can_stash(i)
-		cv.tapped.connect(_on_card)
-		_hand_box.add_child(cv)
-		_cards.append(cv)
-		if deal:
-			var goal := cv.position
-			cv.position = Vector2(-cw, goal.y + 60)
-			cv.modulate.a = 0.0
-			var tw := cv.create_tween()
-			tw.tween_interval(i * 0.06)
-			tw.tween_property(cv, "position", goal, 0.25).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-			tw.parallel().tween_property(cv, "modulate:a", 1.0, 0.15)
+	_hud.queue_redraw()
+	board.sync()
+	_lv_btn.disabled = not run.can_level_up() or _busy
+	_lv_btn.modulate = Color.WHITE if run.can_level_up() else Color(1, 1, 1, 0.55)
+	if run.can_level_up() and _lv_tween == null:
+		_lv_btn.pivot_offset = _lv_btn.size / 2
+		_lv_tween = _lv_btn.create_tween().set_loops()
+		_lv_tween.tween_property(_lv_btn, "scale", Vector2(1.08, 1.08), 0.35)
+		_lv_tween.tween_property(_lv_btn, "scale", Vector2.ONE, 0.35)
+	elif not run.can_level_up() and _lv_tween != null:
+		_lv_tween.kill()
+		_lv_tween = null
+		_lv_btn.scale = Vector2.ONE
+	var counts := {"sonar": run.sonar_left, "mira": run.mira_left, "memo": -1,
+		"pearl": run.items.pearl, "bottle": run.items.bottle}
+	for k in _skills:
+		var sb: SkillButton = _skills[k]
+		sb.count = counts[k]
+		sb.active = board.mode == k
+		sb.queue_redraw()
 
 
 func _set_hint(bb: String) -> void:
@@ -674,226 +630,168 @@ func _set_hint(bb: String) -> void:
 
 # ───────── 操作 ─────────
 
-func _on_card(cv: CardView) -> void:
-	if _busy:
+func _on_skill(id: String) -> void:
+	if _busy or state != PLAY:
 		return
-	var i := cv.index
-	if _sel == i:
-		var d := Cards.def(dive.hand[i])
-		if d.target == "self" and dive.can_play(i):
-			_play(i, dive.ppos())
-			return
-		_select(-1)
-		return
-	_select(i)
-	Audio.sfx("card")
+	_confirm = Vector2i(-1, -1)
+	match id:
+		"sonar", "mira", "memo":
+			if board.mode == id:
+				board.mode = ""
+				_set_hint("")
+			elif (id == "sonar" and run.sonar_left <= 0) or (id == "mira" and run.mira_left <= 0):
+				_set_hint("[color=#ff7a7a]この階ではもう使えない[/color]")
+				return
+			else:
+				board.mode = id
+				Audio.sfx("card")
+				_set_hint({"sonar": "[color=#7fe8ff]音波[/color]：照らしたい所をタップ（そのまわり3×3が安全に見える）",
+					"mira": "[color=#ff8cc8]ミラのカン[/color]：照らしていないマスをタップ。何がいるか教えてくれる",
+					"memo": "[color=#ffa060]メモ[/color]：あやしいマスをタップして「！」を付ける／外す"}[id])
+		"pearl", "bottle":
+			var ev := run.use_item(id)
+			if ev.is_empty():
+				_set_hint("[color=#ff7a7a]持っていない[/color]")
+				return
+			Audio.sfx("bubble")
+			await _run_events(ev)
+	_refresh()
 
 
-func _select(i: int) -> void:
-	_sel = i
-	for c in _cards:
-		c.selected = c.index == i
-	if board == null:
+func _on_level_up() -> void:
+	if _busy or not run.can_level_up():
 		return
-	board.marks.clear()
-	board.preview.clear()
-	_stash_btn.visible = false
-	if i < 0:
-		_set_hint("")
-		return
-	var id: String = dive.hand[i]
-	var d := Cards.def(id)
-	var why := ""
-	if d.cost < 0:
-		why = "[color=#ffd75e]宝は使えない。持ち帰ると %d 点[/color]" % d.value
-	elif d.cost > dive.energy:
-		why = "[color=#ff7a7a]元気が足りない[/color]"
-	elif dive.targets(i).is_empty():
-		why = "[color=#ff7a7a]今は使えない[/color]"
-	var how: String = {"move": "泳ぐ先をタップ", "dive": "どこまで潜るかタップ", "line": "向きをタップ", "adj": "となりの敵をタップ",
-		"self": "カノープスか、カードをもう一度タップ"}.get(d.target, "")
-	_set_hint("[b]%s[/b]　%s\n%s" % [d.name, d.desc.replace("\n", "　"), why if why != "" else "[color=#7fe8ff]%s[/color]" % how])
-	if dive.can_stash(i):
-		_stash_btn.visible = true
-	if not dive.can_play(i):
-		return
-	var col := UiStyle.AQUA if d.kind != "atk" else UiStyle.DANGER
-	for p in dive.targets(i):
-		board.marks[p] = col
-	# 一直線の技は、届く範囲を薄く見せる
-	if d.target == "line":
-		for dir in Dive.DIRS:
-			var p: Vector2i = dive.ppos()
-			for k in int(d.range):
-				p += dir
-				if not dive.inside(p) or dive.tile(p) == Dive.ROCK:
-					break
-				board.preview[p] = col
-	if id == "sonar":
-		for y in Dive.H:
-			for x in Dive.W:
-				if Dive.manhattan(Vector2i(x, y), dive.ppos()) <= Dive.SONAR:
-					board.preview[Vector2i(x, y)] = UiStyle.AQUA
-	if id == "whirl":
-		for y in range(-1, 2):
-			for x in range(-1, 2):
-				board.preview[dive.ppos() + Vector2i(x, y)] = col
+	var ev := run.level_up()
+	await _run_events(ev)
+	_refresh()
 
 
 func _on_cell(p: Vector2i) -> void:
-	if _busy:
-		return
-	if _sel >= 0 and _sel < dive.hand.size():
-		var d := Cards.def(dive.hand[_sel])
-		var at := p
-		# 一直線の技は、線の上ならどこをタップしてもその向きにする
-		if d.target == "line" and not board.marks.has(p):
-			var diff := p - dive.ppos()
-			if (diff.x == 0) != (diff.y == 0):
-				at = dive.ppos() + Vector2i(signi(diff.x), signi(diff.y))
-		if board.marks.has(at):
-			_play(_sel, at)
-			return
-	# 敵をタップしたら説明
-	var u := dive.unit_at(p)
-	if not u.is_empty() and u.id != 0 and dive.is_seen(p):
-		_set_hint(_enemy_info(u))
-		_select_keep_hint()
-		return
-	_select(-1)
-
-
-func _select_keep_hint() -> void:
-	var h := _hint.text
-	_select(-1)
-	_set_hint(h)
-
-
-func _enemy_info(u: Dictionary) -> String:
-	var e: Dictionary = Dive.ENEMIES[u.kind]
-	var how: String = {
-		"fugu": "近づくと起きて追ってくる。となりにいると噛む（%d）" % e.dmg,
-		"kurage": "動かない。2ターンに1回、まわり8マスに電撃（%d）" % e.dmg,
-		"utsubo": "動かない。口の前2マスに入ったままだと噛む（%d）" % e.dmg,
-	}[u.kind]
-	return "[b]%s[/b]　体力 %d\n%s" % [e.name, u.hp, how]
-
-
-func _play(i: int, at: Vector2i) -> void:
-	var id: String = dive.hand[i]
-	_select(-1)
-	_busy = true
-	Audio.sfx("card")
-	var ev := dive.play(i, at)
-	_rebuild_hand(false)
-	_refresh()
-	if id == "sonar" and randf() < 0.5:
-		_say(Scenario.SAY_SONAR)
-	await _run_events(ev)
-	_busy = false
-	_after_events(ev)
-
-
-func _on_stash() -> void:
-	if _busy or _sel < 0 or not dive.can_stash(_sel):
-		return
-	var i := _sel
-	var cv := _cards[i]
-	var from := cv.global_position + cv.size / 2
-	_select(-1)
-	var ev := dive.stash(i)
-	# カードがミラのところへ飛んでいく
-	var tex := CardView.obj_tex(["chest", "coin", "pearl", "gem"][int(Cards.def(ev[0].card).get("obj", 1))])
-	var to := board.global_position + board.mira.position
-	_fly_icon(tex, from, to)
-	board.mira.act(1, 1.0, true)
-	_say(Scenario.SAY_STASH)
-	Audio.sfx("stash")
-	_rebuild_hand(false)
-	_refresh()
-
-
-func _fly_icon(tex: Texture2D, from: Vector2, to: Vector2) -> void:
-	if tex == null:
-		return
-	var t := TextureRect.new()
-	t.texture = tex
-	t.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	t.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	t.size = Vector2(64, 64)
-	t.position = from - Vector2(32, 32)
-	t.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_fx.add_child(t)
-	var tw := t.create_tween()
-	var mid := (from + to) / 2 + Vector2(0, -120)
-	tw.tween_method(func(k: float):
-		var a := from.lerp(mid, k)
-		var b := mid.lerp(to, k)
-		t.position = a.lerp(b, k) - Vector2(32, 32)
-		t.scale = Vector2.ONE * (1.0 - k * 0.4), 0.0, 1.0, 0.5)
-	tw.tween_callback(t.queue_free)
-
-
-func _on_end_turn() -> void:
 	if _busy or state != PLAY:
 		return
-	_select(-1)
+	var c := run.cell(p)
+	match board.mode:
+		"memo":
+			if not c.seen:
+				if board.marks.has(p):
+					board.marks.erase(p)
+				else:
+					board.marks[p] = true
+				Audio.sfx("click", -8.0)
+			return
+		"sonar":
+			board.mode = ""
+			_act(run.sonar(p))
+			return
+		"mira":
+			if c.seen:
+				_set_hint("[color=#ff8cc8]まだ照らしていないマス[/color]をタップしてね")
+				return
+			board.mode = ""
+			_act(run.mira_hint(p))
+			return
+	if not run.reachable(p):
+		if c.seen and c.enemy > 0 and c.alive:
+			_set_hint(_enemy_info(p) + "\n[color=#9fb4c8]まだ届かない[/color]")
+		else:
+			_set_hint("[color=#9fb4c8]照らせるのは、照らしたマスの隣だけ[/color]")
+		return
+	# 間違えて押しやすい所は、もう一度タップで実行
+	var warn := ""
+	if c.seen and c.enemy > 0 and c.alive and c.enemy >= run.hp:
+		warn = "[color=#ff7a7a]今の体力（%d）では負ける！[/color]　もう一度タップで挑む" % run.hp
+	elif not c.seen and board.marks.has(p):
+		warn = "[color=#ffa060]「！」を付けたマス[/color]。もう一度タップで照らす"
+	elif c.seen and c.item == "exit":
+		var hidden := run.all_cells().filter(func(q): return not run.cell(q).seen).size()
+		warn = "[b]次の階へ進む？[/b]　もう一度タップで出口に入る" + ("（まだ %d マス照らしていない）" % hidden if hidden > 0 else "")
+	elif not c.seen and run.air <= 0:
+		warn = "[color=#ff7a7a]空気がない！[/color]　照らすと体力が1減る。もう一度タップで照らす"
+	if warn != "" and _confirm != p:
+		_confirm = p
+		_set_hint(warn)
+		if c.seen and c.enemy > 0 and c.alive:
+			board.flash_tiles([p], UiStyle.DANGER, 0.4)
+		Audio.sfx("alert", -8.0)
+		return
+	_confirm = Vector2i(-1, -1)
+	if c.seen and c.enemy > 0 and c.alive:
+		_set_hint(_enemy_info(p))
+	_act(run.tap(p))
+
+
+func _enemy_info(p: Vector2i) -> String:
+	var kind := run.enemy_kind(p)
+	var note: String = Sweep.NOTES.get(kind, "")
+	return "[b]%s[/b]　強さ %d（倒すと体力-%d、経験値+%d）%s" % [Sweep.NAMES[kind], run.cell(p).enemy, run.cell(p).enemy,
+		run.cell(p).enemy, ("\n" + note) if note != "" else ""]
+
+
+func _act(ev: Array) -> void:
+	if ev.is_empty():
+		return
 	_busy = true
-	_end_btn.disabled = true
-	# 手札を捨てる
-	for c in _cards:
-		var tw := c.create_tween()
-		tw.tween_property(c, "position:y", c.position.y + 260, 0.2).set_ease(Tween.EASE_IN)
-	Audio.sfx("whoosh", -8.0)
-	await _wait(0.2)
-	var ev := dive.end_turn()
+	_refresh()
 	await _run_events(ev)
 	_busy = false
-	_after_events(ev)
-
-
-func _after_events(ev: Array) -> void:
 	if state != PLAY:
 		return
 	for e in ev:
-		if e.t == "faint":
-			_on_faint()
-			return
-		if e.t == "exit":
-			_on_exit()
-			return
-	var drew := false
-	for e in ev:
-		if e.t == "draw":
-			drew = true
-	_rebuild_hand(drew)
+		match e.t:
+			"faint":
+				_on_faint()
+				return
+			"exit":
+				_on_exit()
+				return
+			"star":
+				_on_star()
+				return
 	_refresh()
-	if drew:
-		_turn_quips()
+	_quips()
 
 
-func _turn_quips() -> void:
-	var tcount := 0
-	for c in dive.hand:
-		if Cards.is_treasure(c):
-			tcount += 1
-	if dive.air <= 3 and not _said_low_air:
-		_said_low_air = true
+func _quips() -> void:
+	if run.air <= 3 and not _said.has("air"):
+		_said.air = true
 		_say(Scenario.SAY_LOW_AIR)
-		board.actors[0].act(2, 1.4)
-	elif tcount >= 3:
-		_say(Scenario.SAY_CLOG)
+		board.canopus.act(2, 1.4)
+	elif run.hp <= 2 and not _said.has("hp"):
+		_said.hp = true
+		_say(Scenario.SAY_LOW_HP)
+	# 海竜が見えたら一度だけ
+	for p in board.actors:
+		if run.cell(p).enemy == 10 and run.cell(p).seen and not _said.has("boss"):
+			_said.boss = true
+			_say(Scenario.SAY_BOSS)
 
 
 # ───────── 演出 ─────────
 
-func _actor(id: int) -> Actor:
-	return board.actors.get(id)
+func _cell_pos(p: Vector2i) -> Vector2:
+	return board.global_position + board.center(p)
 
 
-func _at(id: int) -> Vector2:
-	var a := _actor(id)
-	return board.global_position + a.position if a else Vector2.ZERO
+## カノープスを p へ泳がせ、ミラも少し遅れてついてくる
+func _swim_to(p: Vector2i, lunge: bool = false) -> void:
+	var a := board.canopus
+	var to := board.center(p)
+	if lunge:
+		# 敵には体当たりして、手前で止まる
+		to = a.position.lerp(to, 0.7)
+	if a.position.distance_to(to) < 2:
+		return
+	var left := to.x < a.position.x - 1
+	if absf(to.x - a.position.x) > 1:
+		a.flip = left
+	var tw := a.create_tween()
+	tw.tween_property(a, "position", to, 0.16).set_trans(Tween.TRANS_SINE)
+	var mt := board.mira.create_tween()
+	mt.tween_interval(0.08)
+	mt.tween_property(board.mira, "position", board.mira_spot(p, a.flip), 0.22).set_trans(Tween.TRANS_SINE)
+	board.mira.flip = a.flip
+	Audio.sfx("swim", -6.0)
+	await tw.finished
 
 
 func _run_events(ev: Array) -> void:
@@ -901,175 +799,183 @@ func _run_events(ev: Array) -> void:
 		if board == null:
 			return
 		match e.t:
-			"move":
-				await _anim_move(e)
-			"pickup":
-				var at: Vector2 = board.global_position + board.center(e.at)
-				var d := Cards.def(e.card)
-				_float("+%s %d" % [d.name, d.value], at, UiStyle.GOLD, 30)
-				Audio.sfx("gem" if e.item == "gem" else "coin")
-				_fly_icon(CardView.obj_tex(e.item), at, _hud_deck_pos())
-				_actor(0).act(1, 0.8, true)
-				board.mira.act(1, 0.8, true)
-				_say(Scenario.SAY_GEM if e.item == "gem" else Scenario.SAY_PICKUP)
-				await _wait(0.35)
-			"vent":
-				var at: Vector2 = board.global_position + board.center(e.at)
-				board.ring(e.at, 0.8, Color(0.85, 1, 1))
-				_float("空気 +%d" % e.air, at, UiStyle.AIR, 32)
-				Audio.sfx("bubble")
-				_say(Scenario.SAY_VENT)
-				await _wait(0.3)
-			"hit":
-				var a := _actor(e.id)
-				if a:
-					a.flash = 1.0
-					a.act(2, 0.4)
-					_float("-%d" % e.dmg, _at(e.id) + Vector2(0, -30), Color(1, 0.9, 0.5), 34)
-				Audio.sfx("hit")
-				await _wait(0.18)
-			"die":
-				var a := _actor(e.id)
-				if a:
-					var tw := a.create_tween()
-					tw.tween_property(a, "alpha", 0.0, 0.4)
-					tw.parallel().tween_property(a, "position:y", a.position.y - 30, 0.4)
-					tw.tween_callback(func(): a.visible = false)
-				Audio.sfx("pop")
-				if randf() < 0.5:
-					_say(Scenario.SAY_KILL)
-				await _wait(0.25)
-			"push":
-				var a := _actor(e.id)
-				if a:
-					var tw := a.create_tween()
-					tw.tween_property(a, "position", board.center(e.to), 0.14).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
-					await tw.finished
-			"bump":
-				var a := _actor(e.id)
-				if a:
-					var base := a.position
-					var tw := a.create_tween()
-					tw.tween_property(a, "position", base + Vector2(6, 0), 0.04)
-					tw.tween_property(a, "position", base - Vector2(6, 0), 0.04)
-					tw.tween_property(a, "position", base, 0.04)
-				Audio.sfx("bump")
-				await _wait(0.1)
-			"beam":
-				_actor(0).act(3, 0.5)
-				var col := Color(0.6, 0.9, 1.0) if e.kind == "bubble" else Color(0.9, 0.95, 1.0)
-				for k in e.tiles.size():
-					board.flash_tiles([e.tiles[k]], col, 0.45)
-					await _wait(0.04)
-				Audio.sfx("bubble" if e.kind == "bubble" else "whoosh")
-				await _wait(0.1)
-			"whirl":
-				_actor(0).act(3, 0.6)
-				board.ring(e.at, 1.6, Color(0.6, 0.9, 1.0))
-				Audio.sfx("whoosh")
-				await _wait(0.25)
-			"stun":
-				_float("泡づつみ", _at(e.id) + Vector2(0, -40), UiStyle.AIR, 24)
-			"reveal":
-				board.ring(e.at, e.r + 0.5)
-				_actor(0).act(3, 0.6)
-				Audio.sfx("sonar")
-				await _wait(0.45)
-			"wake":
-				_float("！", _at(e.id) + Vector2(0, -50), UiStyle.DANGER, 40)
-				Audio.sfx("alert", -6.0)
-				await _wait(0.12)
+			"open":
+				board.pop(e.cells)
+				board.sync()
+				if e.cells.size() == 1:
+					await _swim_to(e.cells[0])
+				Audio.sfx("bubble" if e.cells.size() > 3 else "click", -6.0)
+				await _wait(0.05)
 			"air":
-				_hud.gauges.queue_redraw()
 				if e.n > 0:
-					_float("空気 +%d" % e.n, _at(0) + Vector2(0, -50), UiStyle.AIR, 30)
+					_float("空気 +%d" % e.n, _cell_pos(run.canopus) + Vector2(0, -50), UiStyle.AIR, 30)
 					Audio.sfx("bubble")
 			"drown":
-				_float("息が……！", _at(0) + Vector2(0, -60), UiStyle.AIR, 30)
-				_actor(0).act(2, 1.0)
-				board.mira.act(2, 1.0)
+				_float("息が……！ -1", _cell_pos(run.canopus) + Vector2(0, -60), UiStyle.AIR, 30)
+				board.canopus.act(2, 1.0)
+				board.canopus.flash = 1.0
 				Audio.sfx("drown")
 				await _wait(0.3)
-			"phit":
-				var a := _actor(0)
-				a.flash = 1.0
-				a.act(2, 0.8)
-				_float("-%d" % e.dmg, _at(0) + Vector2(0, -40), UiStyle.HEART, 40)
-				_shake(12)
-				Audio.sfx("hurt")
-				board.mira.act(2, 1.0)
-				_say(Scenario.SAY_HIT)
-				_hud.gauges.queue_redraw()
-				await _wait(0.35)
-			"block":
-				_float("防いだ！", _at(0) + Vector2(0, -50), Color(1, 0.95, 0.4), 32)
-				Audio.sfx("block")
-				await _wait(0.2)
-			"shield":
-				board.ring(dive.ppos(), 0.6, Color(1, 0.95, 0.4))
-				Audio.sfx("block")
-			"bite":
-				var a := _actor(e.id)
-				if a and a.visible:
-					a.act(3, 0.4)
-					var base := a.position
-					if not e.tiles.is_empty():
-						var tw := a.create_tween()
-						tw.tween_property(a, "position", base.lerp(board.center(e.tiles[0]), 0.4), 0.08)
-						tw.tween_property(a, "position", base, 0.12)
-				board.flash_tiles(e.tiles, UiStyle.DANGER, 0.4)
-				Audio.sfx("bite")
-				await _wait(0.25)
-			"zap":
-				var a := _actor(e.id)
-				if a and a.visible:
-					a.act(3, 0.5)
-				board.flash_tiles(e.tiles, Color(1, 0.95, 0.3), 0.45)
-				Audio.sfx("zap")
+			"fight":
+				var p: Vector2i = e.at
+				var foe: Actor = board.actors.get(p)
+				if foe:
+					foe.visible = true
+					foe.act(3, 0.5)
+				await _swim_to(p, true)
+				if e.dmg > 0:
+					board.canopus.flash = 1.0
+					board.canopus.act(2, 0.6)
+					_float("-%d" % e.dmg, _cell_pos(p) + Vector2(0, -40), UiStyle.HEART, 40)
+					_shake(4 + e.dmg * 2)
+					Audio.sfx("hurt" if e.dmg >= 3 else "hit")
+				else:
+					Audio.sfx("hit")
+				board.canopus.act(3, 0.4)
+				if foe:
+					foe.flash = 1.0
+				_hud.queue_redraw()
 				await _wait(0.3)
+			"kill":
+				var p: Vector2i = e.at
+				var foe: Actor = board.actors.get(p)
+				if foe:
+					foe.act(2, 1.0)
+					var tw := foe.create_tween()
+					tw.tween_property(foe, "alpha", 0.0, 0.4)
+					tw.parallel().tween_property(foe, "position:y", foe.position.y - 30, 0.4)
+					tw.tween_callback(func(): foe.visible = false)
+				_float("経験値 +%d" % e.xp, _cell_pos(p) + Vector2(0, -10), UiStyle.GOLD, 28)
+				Audio.sfx("pop")
+				await _swim_to(p)
+				_hud.queue_redraw()
+				if randf() < 0.3:
+					_say(Scenario.SAY_KILL)
+			"ink":
+				board.flash_tiles(e.cells + [e.at], Color(0.05, 0.02, 0.1), 0.6)
+				board.pop(e.cells)
+				_float("墨が晴れた！", _cell_pos(e.at) + Vector2(0, -60), Color(0.85, 0.85, 1.0), 26)
+				Audio.sfx("whoosh")
+				await _wait(0.3)
+			"item":
+				var p: Vector2i = e.at
+				await _swim_to(p)
+				var text := ""
+				match e.item:
+					"coin":
+						text = "金貨　経験値 +%d" % e.xp
+						if not _said.has("coin"):
+							_said.coin = true
+							_say(Scenario.SAY_PICKUP)
+					"pearl":
+						text = "真珠を拾った"
+					"bottle":
+						text = "空気の結晶を拾った"
+					"chest":
+						text = {"pearl": "宝箱：真珠！", "bottle": "宝箱：空気の結晶！", "coin3": "宝箱：金貨の山！　経験値 +5"}[e.got]
+				_float(text, _cell_pos(p) + Vector2(0, -40), UiStyle.GOLD, 28)
+				Audio.sfx("gem" if e.item == "chest" else "coin")
+				board.canopus.act(1, 0.8, true)
+				board.mira.act(1, 0.8, true)
+				if e.item in ["pearl", "bottle", "chest"] and not _said.has("item"):
+					_said.item = true
+					_say(Scenario.SAY_ITEM)
+				_hud.queue_redraw()
+				await _wait(0.3)
+			"vent":
+				await _swim_to(e.at)
+				board.ring(e.at, 0.8, Color(0.85, 1, 1))
+				_float("空気 +%d" % e.air, _cell_pos(e.at) + Vector2(0, -40), UiStyle.AIR, 32)
+				Audio.sfx("bubble")
+				if not _said.has("vent"):
+					_said.vent = true
+					_say(Scenario.SAY_VENT)
+				await _wait(0.3)
+			"exit":
+				await _swim_to(e.at)
+			"sonar":
+				board.ring(e.at, 2.0)
+				board.pop(e.cells)
+				board.sync()
+				board.canopus.act(3, 0.6)
+				Audio.sfx("sonar")
+				if not _said.has("sonar"):
+					_said.sonar = true
+					_say(Scenario.SAY_SONAR)
+				await _wait(0.45)
+			"hint":
+				await _mira_scout(e.at, e.info)
+			"levelup":
+				_level_banner(e.lv)
+				board.canopus.act(1, 1.4, true)
+				board.mira.act(1, 1.2, true)
+				board.mira.flip = not board.mira.flip
+				board.ring(run.canopus, 1.2, UiStyle.GOLD)
+				Audio.sfx("gem")
+				_say(Scenario.SAY_LEVEL)
+				_hud.queue_redraw()
+				await _wait(0.5)
+			"heal":
+				_float("体力 +%d" % e.n, _cell_pos(run.canopus) + Vector2(0, -50), UiStyle.HEART, 30)
+				Audio.sfx("block")
+				_hud.queue_redraw()
+			"star":
+				board.ring(run.canopus, 3.0, UiStyle.GOLD)
+				Audio.jingle("surface")
+				await _wait(1.0)
 	if board:
-		board.sync_visibility()
+		board.sync()
 
 
-func _anim_move(e: Dictionary) -> void:
-	var a := _actor(e.id)
-	if a == null:
-		return
-	var path: Array = e.path
-	if e.id != 0 and not (dive.is_seen(path[0]) or dive.is_seen(path[-1])):
-		a.position = board.center(path[-1])
-		return
-	if e.id == 0:
-		Audio.sfx("swim")
-	for k in range(1, path.size()):
-		var to := board.center(path[k])
-		var dx: int = path[k].x - path[k - 1].x
-		if dx != 0:
-			a.flip = dx < 0 if e.id == 0 else dx > 0
-		var tw := a.create_tween()
-		tw.tween_property(a, "position", to, 0.11).set_trans(Tween.TRANS_SINE)
-		if e.id == 0:
-			# ミラは少し遅れてついてくる
-			var mt := board.mira.create_tween()
-			mt.tween_interval(0.08)
-			var side := 1.0 if a.flip else -1.0
-			mt.tween_property(board.mira, "position", to + Vector2(cs_side(side), -board.cs * 0.38), 0.16).set_trans(Tween.TRANS_SINE)
-			board.mira.flip = a.flip
-		await tw.finished
-	if e.id != 0:
-		board.sync_visibility()
+## ミラが飛んでいって、そのマスに何がいるか体で教える
+func _mira_scout(p: Vector2i, info: String) -> void:
+	var m := board.mira
+	var home := m.position
+	var tw := m.create_tween()
+	tw.tween_property(m, "position", board.center(p) + Vector2(0, -board.cs * 0.2), 0.3).set_trans(Tween.TRANS_SINE)
+	await tw.finished
+	var key := info
+	if info.begins_with("lv"):
+		key = "strong" if int(info.substr(2)) >= run.hp else "weak"
+	var line: Array = Scenario.MIRA_HINT[key]
+	var f: int = {"safe": 1, "item": 1, "weak": 3, "strong": 2}[key]
+	m.act(f, 0.9, key in ["safe", "item", "weak"])
+	_float(line[1], _cell_pos(p) + Vector2(0, -board.cs * 0.8), UiStyle.PINK, 26)
+	_mira_cry(line[1], line[2])
+	if key == "strong":
+		_shake(4)
+	await _wait(0.7)
+	var back := m.create_tween()
+	back.tween_property(m, "position", board.mira_spot(run.canopus, board.canopus.flip), 0.3).set_trans(Tween.TRANS_SINE)
+	_say_line(line[0], "", "")
+	await back.finished
 
 
-func cs_side(side: float) -> float:
-	return side * board.cs * 0.42
+func _level_banner(lv: int) -> void:
+	var v := _view()
+	var l := UiStyle.label("レベルアップ！　Lv %d" % lv, 56, UiStyle.GOLD, 12)
+	l.size = Vector2(v.x, 80)
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.position = Vector2(0, v.y * 0.4)
+	l.pivot_offset = Vector2(v.x / 2, 40)
+	l.scale = Vector2(0.3, 0.3)
+	_fx.add_child(l)
+	var sub := UiStyle.label("体力が全回復！", 32, UiStyle.AQUA)
+	sub.size = Vector2(v.x, 50)
+	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	sub.position = Vector2(0, v.y * 0.4 + 80)
+	_fx.add_child(sub)
+	var tw := l.create_tween()
+	tw.tween_property(l, "scale", Vector2.ONE, 0.25).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	tw.tween_interval(1.0)
+	tw.tween_property(l, "modulate:a", 0.0, 0.3)
+	tw.tween_callback(l.queue_free)
+	var t2 := sub.create_tween()
+	t2.tween_interval(1.25)
+	t2.tween_property(sub, "modulate:a", 0.0, 0.3)
+	t2.tween_callback(sub.queue_free)
 
 
-func _hud_deck_pos() -> Vector2:
-	var l: Label = _hud.get("deck")
-	return l.global_position + Vector2(40, 10) if l else Vector2.ZERO
-
-
-## カノープスのセリフ（吹き出し）と、ミラの鳴き声・動き
 func _say(arr: Array) -> void:
 	var trip: Array = Scenario.pick(arr)
 	_say_line(trip[0], trip[1], trip[2])
@@ -1110,6 +1016,8 @@ func _say_line(text: String, cry: String, motion: String, delay: float = 0.0) ->
 	tw.tween_interval(2.6)
 	tw.tween_property(p, "modulate:a", 0.0, 0.3)
 	tw.tween_callback(p.queue_free)
+	if cry == "":
+		return
 	# ミラは少し遅れて反応する
 	await _wait(0.5)
 	if board == null:
@@ -1126,7 +1034,7 @@ func _say_line(text: String, cry: String, motion: String, delay: float = 0.0) ->
 
 func _on_exit() -> void:
 	_busy = true
-	var a := _actor(0)
+	var a := board.canopus
 	Audio.sfx("dive")
 	var tw := a.create_tween()
 	tw.tween_property(a, "scale", Vector2(0.2, 0.2), 0.45).set_ease(Tween.EASE_IN)
@@ -1137,40 +1045,40 @@ func _on_exit() -> void:
 	mt.parallel().tween_property(board.mira, "alpha", 0.0, 0.45)
 	await _wait(0.8)
 	_busy = false
-	if dive.floor_no >= Dive.FLOORS:
-		_result = {"kind": "clear", "score": dive.surface(false) + 200}
-		_talk(Scenario.CLEAR_TALK, _show_result_after)
-		return
-	_reward_choices = dive.reward_choices()
-	_reward_taken = false
+	best_floor = max(best_floor, run.floor_no)
+	_save()
+	_perk_choices = run.perk_choices()
 	_show_rest()
+
+
+func _on_star() -> void:
+	clears += 1
+	best_floor = Sweep.FLOORS
+	_save()
+	_result = {"kind": "clear"}
+	_talk(Scenario.CLEAR_TALK, _show_result)
 
 
 func _on_faint() -> void:
 	_busy = true
 	Audio.jingle("faint")
-	_actor(0).act(2, 2.0)
+	board.canopus.act(2, 2.0)
+	board.mira.act(2, 2.0)
 	await _wait(1.0)
 	_busy = false
-	_result = {"kind": "faint", "score": dive.surface(true)}
-	_talk(Scenario.FAINT_TALK, _show_result_after)
+	best_floor = max(best_floor, run.floor_no)
+	_save()
+	_result = {"kind": "faint"}
+	_talk(Scenario.FAINT_TALK, _show_result)
 
 
-func _show_result_after() -> void:
-	_show_result()
-
-
-var _reward_choices := []
-var _reward_taken := false
-
-
+## 空気だまり：体力が全回復し、強化を1つ選んで次の階へ
 func _show_rest() -> void:
 	state = REST
 	_clear_ui()
 	Audio.bgm("rest")
 	var full := _view()
 	var portrait := Screen.portrait
-	# 横画面では左半分に状態とふたり、右半分にカードとボタン
 	var left := Control.new()
 	left.size = Vector2(full.x if portrait else full.x * 0.45, full.y)
 	left.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -1183,11 +1091,9 @@ func _show_rest() -> void:
 	var v := left.size
 	var top := 40.0 if portrait else 90.0
 	_label("空気だまり", 54, Vector2(0, top), left, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("%d階を抜けた！　深さ %dm" % [dive.floor_no, dive.depth_m()], 28, Vector2(0, top + 72), left, Color.WHITE, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	# 状態
-	var st := "体力 %d/%d　　空気 %d/%d　　宝 %d" % [dive.hp, Dive.MAX_HP, dive.air, Dive.MAX_AIR, dive.carried_value()]
-	_label(st, 28, Vector2(0, top + 120), left, UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	# ふたり
+	_label("%d階を抜けた！　体力が全回復する" % run.floor_no, 28, Vector2(0, top + 72), left, Color.WHITE, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("Lv %d　　体力 %d　　敵を %d 体倒した" % [run.lv, run.max_hp, run.kills], 28, Vector2(0, top + 120), left, UiStyle.GOLD,
+		v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	var mini_y := top + 160
 	var c := MiniChar.new("canopus")
 	c.size = Vector2(170, 170)
@@ -1198,73 +1104,35 @@ func _show_rest() -> void:
 	m.position = Vector2(v.x / 2 + 40, mini_y + 40)
 	left.add_child(m)
 	var trip: Array = Scenario.pick(Scenario.REST_TALKS)
-	_label("カノープス「%s」" % trip[0], 24, Vector2(0, mini_y + 180), left, Color.WHITE, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("ミラ「%s」" % trip[1], 24, Vector2(0, mini_y + 214), left, UiStyle.PINK, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	var say := _label("カノープス「%s」" % trip[0], 22, Vector2(20, mini_y + 176), left, Color.WHITE, v.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+	say.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_label("ミラ「%s」" % trip[1], 22, Vector2(0, mini_y + 238), left, UiStyle.PINK, v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	c.act(MiniChar.HAPPY, 1.2, true)
 	m.act(MiniChar.HAPPY, 1.2, true)
-	var cy := mini_y + 270 if portrait else 150.0
+	var cy := mini_y + 280 if portrait else 110.0
 	v = right.size
-	var _ui_parent := right
-	if not _reward_taken:
-		_label("カードを1枚もらえる", 28, Vector2(0, cy), _ui_parent, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-		var cw := 170.0 if portrait else 150.0
-		var gap := 24.0
-		var x0 := v.x / 2 - (cw * 3 + gap * 2) / 2
-		for i in _reward_choices.size():
-			var cv := CardView.new(_reward_choices[i])
-			cv.size = Vector2(cw, cw * 1.45)
-			cv.position = Vector2(x0 + i * (cw + gap), cy + 50)
-			cv.tapped.connect(func(_c):
-				dive.add_card(_reward_choices[i])
-				_reward_taken = true
-				Audio.sfx("get")
-				_show_rest())
-			_ui_parent.add_child(cv)
-		var skip := _button("もらわない", func():
-			_reward_taken = true
-			_show_rest(), 24, Color(0.35, 0.4, 0.5))
-		skip.size = Vector2(220, 56)
-		skip.position = Vector2(v.x / 2 - 110, cy + 70 + cw * 1.45)
-		_ui_parent.add_child(skip)
-		return
-	# 帰るか潜るか
+	_label("強化を1つ選ぶ", 30, Vector2(0, cy), right, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	var bw: float = min(v.x - 60, 560)
-	var up := _button("浮上して持ち帰る（宝 %d）" % dive.carried_value(), func():
-		_result = {"kind": "surface", "score": dive.surface(false)}
-		Audio.jingle("surface")
-		_talk(Scenario.SURFACE_TALK, _show_result_after), 30, Color(0.85, 0.6, 0.15))
-	up.size = Vector2(bw, 90)
-	up.position = Vector2(v.x / 2 - bw / 2, cy + 20)
-	_ui_parent.add_child(up)
-	var nz := (dive.floor_no) / 3
-	var down := _button("もっと潜る（%s %d階・空気+%d）" % [Scenario.ZONES[nz][0], dive.floor_no + 1, Dive.REST_AIR], func():
-		dive.rest()
-		_start_floor(), 30, Color(0.1, 0.4, 0.85))
-	down.size = Vector2(bw, 90)
-	down.position = Vector2(v.x / 2 - bw / 2, cy + 130)
-	_ui_parent.add_child(down)
-	var warn := ""
-	if dive.air + Dive.REST_AIR < 8:
-		warn = "空気が少ない。深い所ほど敵も強い"
-	if dive.hp <= 2:
-		warn = "体力が少ない。気絶すると宝は半分"
-	if warn != "":
-		_label(warn, 24, Vector2(0, cy + 236), _ui_parent, UiStyle.DANGER, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	for i in _perk_choices.size():
+		var id: String = _perk_choices[i]
+		var info: Array = Sweep.PERKS[id]
+		var b := _button("%s\n%s" % info, func():
+			Audio.sfx("get")
+			run.next_floor(id)
+			_start_floor(), 26, [Color(0.15, 0.45, 0.8), Color(0.65, 0.3, 0.6), Color(0.2, 0.55, 0.45)][i])
+		b.size = Vector2(bw, 100)
+		b.position = Vector2(v.x / 2 - bw / 2, cy + 56 + i * 116)
+		right.add_child(b)
 
 
 func _show_result() -> void:
 	state = RESULT
 	_clear_ui()
 	var v := _view()
-	var kind: String = _result.get("kind", "surface")
-	var score: int = _result.get("score", 0)
-	var new_best := score > best
-	if new_best:
-		best = score
-		_save()
+	var kind: String = _result.get("kind", "faint")
 	if kind == "clear":
 		_set_bg("bg_deep", 0.3, 0.0)
-	var title: String = {"surface": "帰ってきた！", "faint": "ミラに助けられた……", "clear": "星のかけらを見つけた！"}[kind]
+	var title: String = {"faint": "ミラに助けられた……", "clear": "星のかけらを見つけた！"}[kind]
 	var portrait := Screen.portrait
 	# 横画面では左にふたり、右に結果
 	var mx := v.x / 2 if portrait else v.x * 0.3
@@ -1292,22 +1160,18 @@ func _show_result() -> void:
 		c.act(MiniChar.HAPPY, 99, true)
 		m.act(MiniChar.HAPPY, 99, true)
 	var y := v.y * 0.24 + 230 if portrait else 150.0
-	_label("深さ %dm まで" % dive.depth_m(), 30, Vector2(0, y), col, UiStyle.AQUA, cw, HORIZONTAL_ALIGNMENT_CENTER)
-	var sc := _label("0", 80, Vector2(0, y + 50), col, UiStyle.GOLD, cw, HORIZONTAL_ALIGNMENT_CENTER)
-	var tw := sc.create_tween()
-	tw.tween_method(func(k: int): sc.text = "宝 %d" % k, 0, score, 1.2)
-	if kind == "clear":
-		_label("（星のかけら +200）", 26, Vector2(0, y + 150), col, Color.WHITE, cw, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("新記録！" if new_best else "best %d" % best, 32, Vector2(0, y + 190), col, UiStyle.PINK if new_best else Color.WHITE,
-		cw, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("%s %d階まで" % [Scenario.ZONES[run.floor_no - 1][0], run.floor_no], 34, Vector2(0, y), col, UiStyle.AQUA, cw, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("Lv %d　敵を %d 体倒した" % [run.lv, run.kills], 34, Vector2(0, y + 56), col, UiStyle.GOLD, cw, HORIZONTAL_ALIGNMENT_CENTER)
+	var sub := "クリア %d回目！" % clears if kind == "clear" else ("今までの最高：%d階" % best_floor)
+	_label(sub, 30, Vector2(0, y + 120), col, UiStyle.PINK if kind == "clear" else Color.WHITE, cw, HORIZONTAL_ALIGNMENT_CENTER)
 	var bw := 300.0
 	var again := _button("もう一度もぐる", _start_run, 32, Color(0.1, 0.5, 0.85))
 	again.size = Vector2(bw, 84)
-	again.position = Vector2(cw / 2 - bw / 2, y + 260)
+	again.position = Vector2(cw / 2 - bw / 2, y + 200)
 	col.add_child(again)
 	var back := _button("タイトルへ", _show_title, 26, Color(0.35, 0.4, 0.5))
 	back.size = Vector2(bw, 64)
-	back.position = Vector2(cw / 2 - bw / 2, y + 360)
+	back.position = Vector2(cw / 2 - bw / 2, y + 300)
 	col.add_child(back)
 
 
@@ -1316,92 +1180,35 @@ func _unhandled_input(e: InputEvent) -> void:
 		if e.keycode == KEY_M:
 			Audio.toggle_mute()
 		if OS.is_debug_build() and state == PLAY and not _busy:
-			# デバッグ：F1 出口へワープ / F2 空気1 / F3 体力1
+			# デバッグ：F1 出口へ / F2 空気1 / F3 体力1 / F4 安全なマスを1つ照らす / F6 気絶 / F7 最下層クリア / F8 経験値+20
 			match e.keycode:
 				KEY_F1:
-					_after_events([{"t": "exit"}])
+					_on_exit()
 				KEY_F2:
-					dive.air = 1
+					run.air = 1
 					_refresh()
 				KEY_F3:
-					dive.hp = 1
-					dive.player().hp = 1
+					run.hp = 1
 					_refresh()
 				KEY_F4:
-					# 撮影用：泳ぐカードで一番深いマスへ
-					for i in dive.hand.size():
-						if Cards.def(dive.hand[i]).target in ["move", "dive"] and dive.can_play(i):
-							var ts := dive.targets(i)
-							ts.sort_custom(func(a, b): return a.y > b.y)
-							_play(i, ts[0])
+					for p in run.all_cells():
+						var c := run.cell(p)
+						if not c.seen and run.reachable(p) and c.enemy == 0:
+							_act(run.tap(p))
 							break
-				KEY_F5:
-					# 撮影用：手札の1枚目を選ぶ
-					_select(0)
 				KEY_F6:
 					_on_faint()
 				KEY_F7:
-					dive.floor_no = Dive.FLOORS
-					_on_exit()
-		if state == PLAY and not _busy and e.keycode == KEY_SPACE:
-			_on_end_turn()
+					_on_star()
+				KEY_F8:
+					run.xp += 20
+					_refresh()
 
 
-# ───────── HUD の絵 ─────────
+# ───────── HUD ─────────
 
-## 体力（ハート）と空気（泡）を並べて描く
-class Gauges extends Control:
-	var game: Node
-
-	func _init() -> void:
-		mouse_filter = Control.MOUSE_FILTER_IGNORE
-
-	func _draw() -> void:
-		var d: Dive = game.dive
-		if d == null:
-			return
-		var font := get_theme_default_font()
-		var h := size.y
-		# ハート
-		var r := h * 0.26
-		for i in Dive.MAX_HP:
-			var c := Vector2(r * 1.3 + i * r * 2.5, h * 0.5)
-			_heart(c, r, UiStyle.HEART if i < d.hp else Color(0.25, 0.25, 0.35))
-		# 空気の泡
-		var x0 := r * 2.5 * Dive.MAX_HP + 30
-		draw_string_outline(font, Vector2(x0, h * 0.68), "空気", HORIZONTAL_ALIGNMENT_LEFT, -1, 24, 6, UiStyle.INK)
-		draw_string(font, Vector2(x0, h * 0.68), "空気", HORIZONTAL_ALIGNMENT_LEFT, -1, 24, UiStyle.AIR)
-		var bx := x0 + 60
-		var room := size.x - bx
-		var step: float = min(room / Dive.MAX_AIR, h * 0.5)
-		var low := d.air <= 3
-		var t := Time.get_ticks_msec() / 1000.0
-		for i in Dive.MAX_AIR:
-			var c := Vector2(bx + step * (i + 0.5), h * 0.5)
-			var br := step * 0.4
-			if i < d.air:
-				var col := UiStyle.AIR if not low else Color(1, 0.5 + 0.3 * sin(t * 8.0), 0.5)
-				draw_circle(c, br, Color(col, 0.35))
-				draw_arc(c, br, 0, TAU, 18, col, 2.5)
-				draw_circle(c + Vector2(-br * 0.35, -br * 0.35), br * 0.25, Color(1, 1, 1, 0.8))
-			else:
-				draw_arc(c, br * 0.7, 0, TAU, 14, Color(0.4, 0.5, 0.6, 0.5), 1.5)
-		if low:
-			queue_redraw()
-
-	func _heart(c: Vector2, r: float, col: Color) -> void:
-		var pts := PackedVector2Array()
-		for k in 24:
-			var a := TAU * k / 24.0
-			var x := 16 * pow(sin(a), 3)
-			var y := -(13 * cos(a) - 5 * cos(2 * a) - 2 * cos(3 * a) - cos(4 * a))
-			pts.append(c + Vector2(x, y) * r / 16.0)
-		draw_colored_polygon(pts, col)
-		draw_polyline(pts + PackedVector2Array([pts[0]]), Color(UiStyle.INK, 0.9), 2.0)
-
-
-## 9つの階を丸で並べ、今いる階を光らせる（3つごとに海の色が変わる）
-class DepthDots extends Control:
+## 上の情報：階・体力・経験値・空気
+class Hud extends Control:
 	var game: Node
 
 	func _init() -> void:
@@ -1411,21 +1218,101 @@ class DepthDots extends Control:
 		queue_redraw()
 
 	func _draw() -> void:
-		var d: Dive = game.dive
-		if d == null:
+		var run: Sweep = game.run
+		if run == null:
 			return
-		var cols := [Color(0.45, 0.9, 1.0), Color(0.3, 0.55, 1.0), Color(0.55, 0.4, 0.95)]
-		var step := size.x / Dive.FLOORS
+		draw_style_box(UiStyle.panel(Color(0.5, 0.85, 1.0, 0.6), Color(0.02, 0.07, 0.15, 0.85)), Rect2(Vector2.ZERO, size))
+		var font := get_theme_default_font()
 		var t := Time.get_ticks_msec() / 1000.0
-		for i in Dive.FLOORS:
-			var c := Vector2(step * (i + 0.5), size.y / 2)
-			var col: Color = cols[i / 3]
-			if i + 1 < d.floor_no:
-				draw_circle(c, step * 0.3, col)
-			elif i + 1 == d.floor_no:
-				draw_circle(c, step * (0.38 + 0.06 * sin(t * 5.0)), UiStyle.GOLD)
+		var z := run.floor_no - 1
+		_text(font, "%s %d階" % [Scenario.ZONES[z][0], run.floor_no], Vector2(16, 34), 26, UiStyle.GOLD)
+		# 3つの階の丸（最後は星）
+		for i in Sweep.FLOORS:
+			var c := Vector2(170 + i * 34, 25)
+			if i + 1 < run.floor_no:
+				draw_circle(c, 9, UiStyle.AQUA)
+			elif i + 1 == run.floor_no:
+				draw_circle(c, 11 + sin(t * 5.0) * 1.5, UiStyle.GOLD)
 			else:
-				draw_arc(c, step * 0.28, 0, TAU, 16, Color(col, 0.6), 2.0)
-			if i == Dive.FLOORS - 1:
-				# いちばん下は星
-				draw_string(get_theme_default_font(), c + Vector2(-8, 8), "★", HORIZONTAL_ALIGNMENT_LEFT, -1, 18, UiStyle.GOLD)
+				draw_arc(c, 9, 0, TAU, 16, Color(UiStyle.AQUA, 0.6), 2.0)
+		_text(font, "★", Vector2(170 + 3 * 34 - 10, 34), 22, UiStyle.GOLD)
+		_text(font, "Lv %d" % run.lv, Vector2(330, 36), 30, Color.WHITE)
+		var w: float = size.x - 190
+		# 体力
+		_bar(font, Vector2(16, 58), w, "体力", run.hp, run.max_hp, UiStyle.HEART if run.hp > 2 else Color(1, 0.3 + 0.2 * sin(t * 8.0), 0.3))
+		# 経験値
+		var need := run.xp_need()
+		_bar(font, Vector2(16, 84), w, "経験", mini(run.xp, need), need, UiStyle.GOLD if run.xp < need else Color(1, 0.9, 0.4 + 0.3 * sin(t * 6.0)))
+		# 空気
+		var air_col := UiStyle.AIR if run.air > 3 else Color(1, 0.5 + 0.3 * sin(t * 8.0), 0.5)
+		_bar(font, Vector2(16, 110), w, "空気", run.air, max(run.air, Sweep.START_AIR + (10 if run.has_perk("lung") else 0)), air_col)
+
+	func _bar(font: Font, at: Vector2, w: float, name: String, v: int, mx: int, col: Color) -> void:
+		_text(font, name, at + Vector2(0, 18), 20, Color(0.85, 0.92, 1.0))
+		var r := Rect2(at + Vector2(56, 2), Vector2(w - 140, 18))
+		draw_rect(r, Color(0, 0, 0, 0.5))
+		var k: float = clamp(float(v) / max(mx, 1), 0.0, 1.0)
+		draw_rect(Rect2(r.position, Vector2(r.size.x * k, r.size.y)), col)
+		draw_rect(r, Color(1, 1, 1, 0.4), false, 1.5)
+		_text(font, "%d / %d" % [v, mx], at + Vector2(w - 76, 18), 20, Color.WHITE)
+
+	func _text(font: Font, s: String, at: Vector2, fs: int, col: Color) -> void:
+		draw_string_outline(font, at, s, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, 6, UiStyle.INK)
+		draw_string(font, at, s, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, col)
+
+
+## 下の技・持ち物ボタン。絵と名前と残り回数
+class SkillButton extends Control:
+	signal pressed(id: String)
+	const ICONS := {"sonar": 2, "mira": 9, "memo": -1, "pearl": -1, "bottle": 5}
+	static var _icons: Texture2D
+	static var _pearl: Texture2D
+	var id := ""
+	var title := ""
+	var color := Color.WHITE
+	var count := 0
+	var active := false
+
+	func _init() -> void:
+		mouse_filter = Control.MOUSE_FILTER_STOP
+		if _icons == null:
+			_icons = load("res://assets/images/ui/icons.png")
+			_pearl = load("res://assets/images/obj/pearl.png")
+
+	func _gui_input(e: InputEvent) -> void:
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+			pressed.emit(id)
+			accept_event()
+
+	func _draw() -> void:
+		var usable := count != 0
+		var bg := Color(color.darkened(0.6), 0.92) if usable else Color(0.1, 0.12, 0.16, 0.85)
+		var edge := UiStyle.GOLD if active else Color(color, 0.9 if usable else 0.3)
+		var sb := UiStyle.panel(edge, bg, 10 if active else 2, 16)
+		sb.set_border_width_all(4 if active else 2)
+		draw_style_box(sb, Rect2(Vector2.ZERO, size))
+		var font := get_theme_default_font()
+		var art := Rect2(size.x * 0.18, 8, size.x * 0.64, size.x * 0.64)
+		var mod := Color.WHITE if usable else Color(0.45, 0.45, 0.5)
+		var ix: int = ICONS[id]
+		if id == "memo":
+			var fs := int(size.x * 0.5)
+			var w := font.get_string_size("！", HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
+			draw_string_outline(font, Vector2(size.x / 2 - w / 2, art.get_center().y + fs * 0.36), "！", HORIZONTAL_ALIGNMENT_LEFT, -1, fs, 6, UiStyle.INK)
+			draw_string(font, Vector2(size.x / 2 - w / 2, art.get_center().y + fs * 0.36), "！", HORIZONTAL_ALIGNMENT_LEFT, -1, fs, color)
+		elif id == "pearl" and _pearl:
+			draw_texture_rect(_pearl, art, false, mod)
+		elif _icons:
+			var cell := _icons.get_size().x / 4
+			draw_texture_rect_region(_icons, art, Rect2((ix % 4) * cell, (ix / 4) * cell, cell, cell), mod)
+		var fs2: int = min(22, int((size.x - 8) / max(title.length(), 1)))
+		var tw := font.get_string_size(title, HORIZONTAL_ALIGNMENT_LEFT, -1, fs2).x
+		draw_string_outline(font, Vector2(size.x / 2 - tw / 2, size.y - 12), title, HORIZONTAL_ALIGNMENT_LEFT, -1, fs2, 5, UiStyle.INK)
+		draw_string(font, Vector2(size.x / 2 - tw / 2, size.y - 12), title, HORIZONTAL_ALIGNMENT_LEFT, -1, fs2, Color.WHITE)
+		if count >= 0:
+			var c := Vector2(size.x - 16, 16)
+			draw_circle(c, 14, UiStyle.INK)
+			draw_circle(c, 12, color if usable else Color(0.3, 0.3, 0.35))
+			var s := str(count)
+			var cw := font.get_string_size(s, HORIZONTAL_ALIGNMENT_LEFT, -1, 20).x
+			draw_string(font, c + Vector2(-cw / 2, 7), s, HORIZONTAL_ALIGNMENT_LEFT, -1, 20, UiStyle.INK)
