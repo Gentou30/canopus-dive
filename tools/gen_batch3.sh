@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# 3版目：カノープスとミラのドット絵（4コマ）とタイトル絵
+cd ~/Projects/canopus-dive
+P="16-bit retro pixel art game sprite sheet, crisp hard-edged pixels, no anti-aliasing, limited palette, dark 1-pixel outline, chibi proportions (big head, about 2.5 heads tall), cute kemono style, all-ages."
+L="Exactly 4 frames of the SAME character in one horizontal row, evenly spaced with wide gaps, each frame full body, same size and same design in every frame, facing slightly right. Plain flat pure green (#00FF00) background with nothing else, no shadows, no text, no grid."
+gen(){ tools/gen_image.sh "$@" & }
+gen art/raw/px_canopus.png "$P $L Character: Canopus, the orca x dragon girl from the reference (black and cream-white body, yellow arm bands and crescent marks, silver hair, small white horns, big yellow-rimmed ears, blue scarf, brown satchel, orca tail). Frame 1: idle, swimming in place with a confident grin. Frame 2: happy, fist pump with sparkles. Frame 3: panicking, out of breath with sweat and bubbles. Frame 4: a powerful spinning tail-slap attack." art/raw/canopus_base.png
+gen art/raw/px_mira.png "$P $L Character: Mira, the small blue axolotl x dragon creature from the reference (periwinkle blue, pink stripes on long ear-fronds, gill fronds, huge dark eyes, pink bat wings, heart on chest). She never talks. Frame 1: idle, floating with wings gently spread. Frame 2: happy, wings raised high with small pink hearts. Frame 3: worried, ears drooping, teary eyes, hugging herself. Frame 4: alert, pointing forward with a wing, an exclamation spark above the head." art/raw/mira_base.png
+wait
+gen art/raw/title.png "Key visual illustration for a cute all-ages underwater treasure-hunt game, painterly anime style, vertical 2:3. Canopus (the orca x dragon girl in the first reference, with blue scarf and satchel) dives downward energetically, holding a glowing gold coin, while small Mira (the blue axolotl dragon with pink wings in the second reference) follows close behind, flapping her wings like fins. Sunlight rays from the surface above, schools of fish, coral, treasure sparkling far below, and a faint star-shaped glow deep in the abyss at the bottom. Leave the top quarter calm for a title logo. No text, no letters." art/raw/canopus_base.png art/raw/mira_base.png
+wait

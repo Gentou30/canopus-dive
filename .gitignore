@@ -1,0 +1,9 @@
+# Godot
+.godot/
+/build/
+*.tmp
+# OS
+.DS_Store
+version.txt
+# ユーザーの写真（参照用）は公開しない
+art/raw/ref_*
