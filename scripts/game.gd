@@ -1267,7 +1267,7 @@ func _show_result() -> void:
 	var title: String = {"surface": "帰ってきた！", "faint": "ミラに助けられた……", "clear": "星のかけらを見つけた！"}[kind]
 	var portrait := Screen.portrait
 	# 横画面では左にふたり、右に結果
-	var mx := v.x / 2 if portrait else v.x * 0.27
+	var mx := v.x / 2 if portrait else v.x * 0.3
 	var my := v.y * 0.24 if portrait else v.y * 0.3
 	var col := Control.new()
 	col.position = Vector2(0 if portrait else v.x * 0.48, 0)
