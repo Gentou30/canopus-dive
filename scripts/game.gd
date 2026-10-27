@@ -6,7 +6,8 @@ extends Control
 
 enum { TITLE, PLAY, REST, RESULT }
 
-const BGS := ["bg_shallow", "bg_mid", "bg_deep"]
+const BGS := ["bg_shallow", "bg_mid", "bg_deep", "bg_deep"]
+const BGMS := ["shallow", "mid", "deep", "boss"]
 const SAVE_PATH := "user://save.cfg"
 const HL_MOVE := Color(0.1, 0.75, 1.0, 0.7)
 const HL_ATK := Color(1.0, 0.2, 0.25, 0.75)
@@ -527,7 +528,7 @@ func _start_stage(ev: Array) -> void:
 	_bg.texture = null
 	_bg_shade.color = Color(0, 0, 0, 0)
 	_ocean.setup(_view(), 0.0)
-	Audio.bgm(["shallow", "mid", "deep"][z])
+	Audio.bgm(BGMS[z])
 	_drop_world()
 	world = World.new()
 	world.size = _view()
@@ -535,6 +536,8 @@ func _start_stage(ev: Array) -> void:
 	world.setup(run, z)
 	world.cell_tapped.connect(_on_cell)
 	_build_play()
+	if run.is_boss_stage():
+		await _boss_intro()
 	_floor_banner()
 	var pair: Array = Scenario.pick(Scenario.FLOOR_START[z])
 	_say_line(pair[0], "きゅ", pair[1], 1.4)
@@ -543,6 +546,35 @@ func _start_stage(ev: Array) -> void:
 		_set_hint("[color=#ffd75e]カードをタップ[/color] → [color=#7fe8ff]光るマスをタップ[/color]で動く。1ターンに2回まで。\nオレンジの扇は敵の視界。そこで止まると見つかる！")
 	if ev.size() > 0:
 		_refresh()
+
+
+## ボスの前：海竜の絵を見せて会話
+func _boss_intro() -> void:
+	_busy = true
+	var v := _view()
+	var pic := TextureRect.new()
+	pic.texture = load("res://assets/images/ev_boss.jpg")
+	pic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	pic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+	pic.size = v
+	pic.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pic.z_index = 120
+	pic.modulate.a = 0.0
+	_ui.add_child(pic)
+	var tw := pic.create_tween()
+	tw.tween_property(pic, "modulate:a", 1.0, 0.6)
+	await tw.finished
+	Audio.sfx("roar")
+	# ラムダは外の変数を書きかえられないので、配列で受けわたす
+	var done := [false]
+	_talk(Scenario.BOSS_TALK, func(): done[0] = true)
+	while not done[0]:
+		await get_tree().process_frame
+	var t2 := pic.create_tween()
+	t2.tween_property(pic, "modulate:a", 0.0, 0.5)
+	t2.tween_callback(pic.queue_free)
+	await t2.finished
+	_busy = false
 
 
 func _floor_banner() -> void:
@@ -559,7 +591,7 @@ func _floor_banner() -> void:
 	band.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	box.add_child(band)
 	_label("%s　%s" % Scenario.ZONES[z], 54, Vector2(0, 14), box, UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("%d階　・　深さ %dm" % [run.stage, run.stage * 120], 32, Vector2(0, 90), box, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("%d階　・　深さ %dm" % [run.stage, run.stage * 120] if not run.is_boss_stage() else "最深部　・　深さ ???m", 32, Vector2(0, 90), box, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	var tw := box.create_tween()
 	tw.tween_property(box, "position:x", 0.0, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 	tw.tween_interval(1.0)
@@ -833,11 +865,12 @@ func _on_cell(p: Vector2i) -> void:
 func _show_enemy(u: Dictionary) -> void:
 	var d: Dictionary = Tactics.ENEMIES[u.kind]
 	var st: String = {"patrol": "見張り中", "alert": "[color=#ff6a6a]追いかけてくる！[/color]", "invest": "音を調べに行く",
-		"search": "さがしている", "return": "持ち場に戻る"}.get(u.state, "")
+		"search": "さがしている", "return": "持ち場に戻る", "sleep": "眠っている（近づくと起きる）"}.get(u.state, "")
 	if u.stun > 0:
 		st = "気絶中（1回休み）"
 	var note: String = {"patrol": "決まった道を行ったり来たり", "sentry": "その場で向きを変える", "fixed": "動かない。前とまわりにかみつく",
-		"drift": "目が見えない。ふらふら動いて、となりを刺す"}[u.move]
+		"drift": "目が見えない。ふらふら動いて、となりを刺す",
+		"boss": "赤く光るマスに次のターン攻撃。泡のブレスか音波で気絶させると止まる。押し出せない"}[u.move]
 	_set_hint("[b]%s[/b]　体力 %d/%d　攻撃 %d　%s\n[color=#9fb4c8]%s[/color]" % [d.name, u.hp, u.max_hp, u.atk, st, note])
 	var cells := {}
 	for q in run.vision(u):
@@ -895,6 +928,9 @@ func _act(ev: Array, step: float = 0.16) -> void:
 				return
 			"exit":
 				_on_exit()
+				return
+			"star":
+				_on_star()
 				return
 	_refresh()
 	if _sel < 0:
@@ -990,12 +1026,56 @@ func _run_events(ev: Array, step: float) -> void:
 						_said.hit = true
 						_say(Scenario.SAY_HIT)
 				await _wait(0.3)
+			"spot" when e.get("boss", false) or (run.unit_by_id(e.id) != null and run.unit_by_id(e.id).move == "boss"):
+				world.refresh()
+				var bv := world.view(e.id)
+				if bv:
+					bv.pose(3, 1.2)
+				Audio.sfx("roar")
+				world.shake(2.0)
+				_mini_banner("海竜が目をさました！", Color(0.6, 0.9, 1.0))
+				_say(Scenario.SAY_BOSS_WAKE)
+				await _wait(0.9)
+			"warn":
+				world.set_danger(e.tiles)
+				if e.get("cancel", false):
+					var bv := world.view(e.id)
+					if bv:
+						world.pop_text(bv.position + Vector3(0, 1.2, 0), "攻撃を止めた！", UiStyle.GOLD, 72)
+					Audio.sfx("block")
+					if not _said.has("cancel"):
+						_said.cancel = true
+						_say(Scenario.SAY_CANCEL)
+				elif not e.tiles.is_empty():
+					var bv := world.view(e.id)
+					if bv:
+						bv.pose(3, 0.8)
+						world.pop_text(bv.position + Vector3(0, 1.4, 0), Tactics.BOSS_ATTACKS[e.kind].name + "の構え", Color(1, 0.5, 0.45), 64)
+					Audio.sfx("warn")
+					if not _said.has("warn"):
+						_said.warn = true
+						_say(Scenario.SAY_WARN)
+					await _wait(0.5)
+			"boss_atk":
+				var bv := world.view(e.id)
+				if bv:
+					bv.pose(3, 0.8)
+				Audio.sfx("breath" if e.kind == "breath" else ("roar" if e.kind == "tail" else "whoosh"))
+				for q in e.tiles:
+					world.ring(q, 0.7, Color(0.5, 0.9, 1.0, 0.9) if e.kind != "whirl" else Color(0.3, 0.6, 1.0, 0.9), 0.4)
+				world.shake(1.5)
+				await _wait(0.4)
+			"star":
+				Audio.sfx("star")
+				world.burst(world.cell3(e.at), Color(1, 0.85, 0.4, 0.95), 40)
+				world.shake(1.0)
+				await _wait(1.2)
 			"spot":
 				var uv := world.view(e.id)
 				world.refresh()
 				if uv:
 					uv.pose(3, 0.6)
-				Audio.sfx("alert", -2.0 if not e.get("called", false) else -8.0)
+				Audio.sfx("spot" if not e.get("called", false) else "alert", -2.0 if not e.get("called", false) else -8.0)
 				if not e.get("called", false):
 					world.shake(0.8)
 					_mini_banner("見つかった！", Color(1, 0.35, 0.3))
@@ -1231,6 +1311,10 @@ func _on_star() -> void:
 	_save()
 	_result = {"kind": "clear"}
 	Audio.jingle("surface")
+	await _wait(1.0)
+	_clear_ui()
+	_drop_world()
+	_set_bg("ev_clear", 0.0, 0.0)
 	_talk(Scenario.CLEAR_TALK, _show_result)
 
 
@@ -1252,7 +1336,7 @@ func _show_rest() -> void:
 	state = REST
 	_clear_ui()
 	_drop_world()
-	_set_bg(BGS[mini(run.stage, 2)], 0.45, 0.6)
+	_set_bg(BGS[mini(run.stage, 3)], 0.45, 0.6)
 	Audio.bgm("rest")
 	var full := _view()
 	var portrait := Screen.portrait
@@ -1330,7 +1414,7 @@ func _show_result() -> void:
 	_drop_world()
 	var v := _view()
 	var kind: String = _result.get("kind", "faint")
-	_set_bg("bg_deep" if kind == "clear" else BGS[run.stage - 1], 0.35, 0.3)
+	_set_bg("ev_clear" if kind == "clear" else BGS[run.stage - 1], 0.45 if kind == "clear" else 0.35, 0.3)
 	var title: String = {"faint": "ミラに助けられた……", "clear": "星のかけらを見つけた！"}[kind]
 	var portrait := Screen.portrait
 	var mx := v.x / 2 if portrait else v.x * 0.3
@@ -1358,7 +1442,7 @@ func _show_result() -> void:
 		c.act(MiniChar.HAPPY, 99, true)
 		m.act(MiniChar.HAPPY, 99, true)
 	var y := v.y * 0.24 + 230 if portrait else 150.0
-	_label("%s %d階まで" % [Scenario.ZONES[run.stage - 1][0], run.stage], 34, Vector2(0, y), col, UiStyle.AQUA, cw, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("海竜をたおして星を取りもどした" if kind == "clear" else "%s %d階まで" % [Scenario.ZONES[run.stage - 1][0], run.stage], 34, Vector2(0, y), col, UiStyle.AQUA, cw, HORIZONTAL_ALIGNMENT_CENTER)
 	_label("倒した敵 %d　見つかった %d回" % [run.kills, run.spotted_total], 30, Vector2(0, y + 56), col, UiStyle.GOLD, cw, HORIZONTAL_ALIGNMENT_CENTER)
 	var sub := "クリア %d回目！" % clears if kind == "clear" else ("今までの最高：%d階" % best_floor)
 	_label(sub, 30, Vector2(0, y + 116), col, UiStyle.PINK if kind == "clear" else Color.WHITE, cw, HORIZONTAL_ALIGNMENT_CENTER)
@@ -1399,6 +1483,10 @@ func _unhandled_input(e: InputEvent) -> void:
 					_on_faint()
 				KEY_F7:
 					_on_star()
+				KEY_F10:
+					# ボスの階へ
+					run.stage = Tactics.STAGES
+					_start_stage(run.start_stage())
 				KEY_F9:
 					# いちばん出口に近づける泳ぎ方を自動で選ぶ（画面確認用）
 					_debug_step()
@@ -1414,6 +1502,15 @@ func _debug_step() -> void:
 	for q in run.items:
 		if run.items[q] == "exit":
 			exit = q
+	var b = run.boss()
+	if b != null:
+		exit = b.pos
+		for i in run.hand.size():
+			if run.can_play(i) and Cards.def(run.hand[i]).kind == "atk" and run.targets(i).has(b.pos):
+				_sel = i
+				_mode = "act"
+				_play(b.pos)
+				return
 	var best := -1
 	var at := Vector2i.ZERO
 	var bd := 999

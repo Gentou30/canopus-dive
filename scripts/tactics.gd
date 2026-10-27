@@ -16,7 +16,7 @@ extends RefCounted
 const W := 9
 const H := 13
 const DIRS := [Vector2i(0, -1), Vector2i(1, 0), Vector2i(0, 1), Vector2i(-1, 0)]
-const STAGES := 3
+const STAGES := 4          # 4階目は海竜の待つ最深部（ボス戦）
 
 const MAX_HP := 12
 const MAX_AIR := 40
@@ -36,6 +36,14 @@ const ENEMIES := {
 	"kani": {"name": "オオガニ", "hp": 4, "atk": 2, "sight": 2, "speed": 1, "aspeed": 2, "move": "patrol"},
 	"utsubo": {"name": "ウツボ", "hp": 3, "atk": 2, "sight": 2, "speed": 0, "aspeed": 0, "move": "fixed"},
 	"same": {"name": "サメ", "hp": 6, "atk": 3, "sight": 4, "speed": 1, "aspeed": 3, "move": "patrol"},
+	"ryu": {"name": "海竜", "hp": 22, "atk": 4, "sight": 0, "speed": 1, "aspeed": 1, "move": "boss"},
+}
+
+## 海竜の技：予告したマスに次の敵のターンで当たる。泡のブレスや音波で気絶させると取り消せる
+const BOSS_ATTACKS := {
+	"tail": {"name": "尾の一撃", "dmg": 3},
+	"breath": {"name": "竜のブレス", "dmg": 4},
+	"whirl": {"name": "大渦", "dmg": 2},
 }
 
 ## 階ごとの敵
@@ -43,6 +51,7 @@ const STAGE_ENEMIES := [
 	["fugu", "fugu", "ankou", "kurage"],
 	["fugu", "fugu", "kani", "utsubo", "ankou", "kurage"],
 	["same", "kani", "fugu", "fugu", "ankou", "utsubo", "kurage"],
+	["fugu", "fugu"],
 ]
 
 var rng := RandomNumberGenerator.new()
@@ -93,7 +102,10 @@ func start_stage() -> Array:
 	hidden = false
 	shield = 0
 	air = MAX_AIR
-	_build_map()
+	if is_boss_stage():
+		_build_boss_map()
+	else:
+		_build_map()
 	deck = owned.duplicate()
 	_shuffle(deck)
 	hand.clear()
@@ -102,6 +114,54 @@ func start_stage() -> Array:
 	var ev := []
 	_begin_turn(ev)
 	return ev
+
+
+func is_boss_stage() -> bool:
+	return stage >= STAGES
+
+
+func boss():
+	for u in enemies():
+		if u.move == "boss":
+			return u
+	return null
+
+
+## 最深部：柱と海藻のある広間。奥で海竜が星を抱いて眠っている
+func _build_boss_map() -> void:
+	for attempt in 50:
+		tiles = PackedInt32Array()
+		tiles.resize(W * H)
+		tiles.fill(FLOOR)
+		items.clear()
+		units.clear()
+		_next_id = 1
+		for p in [Vector2i(2, 4), Vector2i(6, 4), Vector2i(1, 8), Vector2i(7, 8), Vector2i(4, 6)]:
+			_put(p, ROCK)
+		for p in [Vector2i(0, 5), Vector2i(0, 6), Vector2i(8, 5), Vector2i(8, 6), Vector2i(3, 10), Vector2i(5, 10),
+				Vector2i(2, 2), Vector2i(6, 2)]:
+			_put(p, WEED)
+		for x in W:
+			_put(Vector2i(x, H - 1), ROCK)
+		var start := Vector2i(W / 2, 0)
+		units.append({"id": 0, "kind": "canopus", "pos": start, "dir": Vector2i(0, 1), "hp": hp})
+		items[Vector2i(0, 9)] = "vent"
+		items[Vector2i(8, 2)] = "vent"
+		items[Vector2i(0, 1)] = "pearl"
+		items[Vector2i(8, 10)] = "vent"
+		var d: Dictionary = ENEMIES["ryu"]
+		var bp := Vector2i(W / 2, H - 3)
+		units.append({"id": _next_id, "kind": "ryu", "pos": bp, "dir": Vector2i(0, -1), "hp": int(d.hp), "max_hp": int(d.hp),
+			"atk": int(d.atk), "sight": 0, "speed": 1, "aspeed": 1, "move": "boss", "state": "sleep", "route": [bp], "ri": 0,
+			"rstep": 1, "last_seen": Vector2i(-1, -1), "lost": 0, "stun": 0, "invest": Vector2i(-1, -1), "wait": 0,
+			"home": bp, "home_dir": Vector2i(0, -1), "pending": [], "pkind": "", "acount": 0, "sleep_turns": 0})
+		_next_id += 1
+		var ok := true
+		for kind in STAGE_ENEMIES[STAGES - 1]:
+			if not _place_enemy(kind, start):
+				ok = false
+		if ok:
+			return
 
 
 func _build_map() -> void:
@@ -543,8 +603,7 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 					if u != null:
 						_hit(u, int(d.dmg), Vector2i.ZERO, ev)
 						if d.has("stun") and u.hp > 0:
-							u.stun = int(d.stun)
-							ev.append({"t": "stun", "id": u.id})
+							_stun(u, int(d.stun), ev)
 						if not d.get("pierce", false):
 							break
 			"whirl":
@@ -559,8 +618,7 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 				ev.append({"t": "sonar", "at": pos, "r": int(d.radius)})
 				for u in enemies():
 					if _dist(u.pos, pos) <= int(d.radius) and u.hp > 0:
-						u.stun = int(d.stun)
-						ev.append({"t": "stun", "id": u.id})
+						_stun(u, int(d.stun), ev)
 			"hide":
 				hidden = true
 				ev.append({"t": "hide"})
@@ -582,6 +640,15 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 				ev.append({"t": "heal", "n": n})
 	_check_spotted(ev)
 	return ev
+
+
+func _stun(u: Dictionary, n: int, ev: Array) -> void:
+	u.stun = n
+	ev.append({"t": "stun", "id": u.id})
+	# 海竜の予告攻撃は、気絶させると取り消せる
+	if u.move == "boss" and not u.pending.is_empty():
+		u.pending = []
+		ev.append({"t": "warn", "id": u.id, "tiles": [], "kind": "", "cancel": true})
 
 
 func _dir_to(from: Vector2i, to: Vector2i) -> Vector2i:
@@ -652,7 +719,7 @@ func _hit(u: Dictionary, dmg: int, push: Vector2i, ev: Array) -> void:
 	if sneak:
 		dmg *= 2
 	var wall := false
-	if push != Vector2i.ZERO and u.hp > dmg:
+	if push != Vector2i.ZERO and u.hp > dmg and u.move != "boss":
 		var dir := Vector2i(signi(push.x), signi(push.y))
 		var to: Vector2i = u.pos + dir
 		if walkable_tile(to) and unit_at(to) == null and items.get(to, "") != "exit":
@@ -668,6 +735,11 @@ func _hit(u: Dictionary, dmg: int, push: Vector2i, ev: Array) -> void:
 		units.erase(u)
 		kills += 1
 		ev.append({"t": "die", "id": u.id})
+		if u.move == "boss":
+			# 海竜を倒すと星のかけらが手に入る
+			cleared = true
+			exited = true
+			ev.append({"t": "star", "at": u.pos})
 	elif u.state != "alert":
 		# 攻撃された敵はこちらに気づく
 		_alert(u, ev, false)
@@ -719,6 +791,9 @@ func _alert(u: Dictionary, ev: Array, spread: bool) -> void:
 func _check_spotted(ev: Array) -> void:
 	if exited or hp <= 0:
 		return
+	var b = boss()
+	if b != null and b.state == "sleep" and _dist(b.pos, me().pos) <= 2:
+		_wake(b, ev)
 	for u in enemies():
 		if sees(u, me().pos):
 			if u.state != "alert":
@@ -786,6 +861,9 @@ func _enemy_act(u: Dictionary, ev: Array) -> void:
 		u.stun -= 1
 		return
 	var pos: Vector2i = me().pos
+	if u.move == "boss":
+		_boss_act(u, ev)
+		return
 	if u.move == "drift":
 		# クラゲ：ふらふら動いて、となりにいたら刺す
 		if _dist(u.pos, pos) == 1:
@@ -848,6 +926,83 @@ func _enemy_act(u: Dictionary, ev: Array) -> void:
 			else:
 				u.last_seen = pos
 				u.lost = 0
+
+
+func _wake(u: Dictionary, ev: Array) -> void:
+	u.state = "alert"
+	u.last_seen = me().pos
+	ev.append({"t": "spot", "id": u.id, "boss": true})
+
+
+## 海竜：眠っている間はじっとしている（近づくか攻撃すると起きる。6ターンで自然に起きる）。
+## 起きたら「予告 → 次のターンに攻撃」をくり返す。予告していないときは1マス近づく
+func _boss_act(u: Dictionary, ev: Array) -> void:
+	var pos: Vector2i = me().pos
+	if u.state != "alert":
+		u.sleep_turns += 1
+		if u.sleep_turns >= 6:
+			_wake(u, ev)
+		return
+	if not u.pending.is_empty():
+		var a: Dictionary = BOSS_ATTACKS[u.pkind]
+		ev.append({"t": "boss_atk", "id": u.id, "kind": u.pkind, "tiles": u.pending})
+		var hit_me: bool = pos in u.pending
+		# 子分も巻きこまれる
+		for o in enemies():
+			if o.id != u.id and o.pos in u.pending and units.has(o):
+				_hit(o, int(a.dmg), Vector2i.ZERO, ev)
+		if hit_me:
+			_hurt_me(int(a.dmg), u, ev)
+		u.pending = []
+		ev.append({"t": "warn", "id": u.id, "tiles": [], "kind": ""})
+		return
+	var cheb: int = maxi(abs(pos.x - u.pos.x), abs(pos.y - u.pos.y))
+	var kind := ""
+	var tiles := []
+	u.acount += 1
+	if cheb <= 1:
+		kind = "tail"
+		for dx in [-1, 0, 1]:
+			for dy in [-1, 0, 1]:
+				var p: Vector2i = u.pos + Vector2i(dx, dy)
+				if p != u.pos and walkable_tile(p):
+					tiles.append(p)
+	elif u.acount % 3 == 0:
+		kind = "whirl"
+		# カノープスのまわりに渦。真ん中と、ななめ4マス
+		for d in [Vector2i.ZERO, Vector2i(1, 1), Vector2i(-1, 1), Vector2i(1, -1), Vector2i(-1, -1)]:
+			var p: Vector2i = pos + d
+			if walkable_tile(p):
+				tiles.append(p)
+	else:
+		kind = "breath"
+		if _dist(u.pos, pos) > 4:
+			_step_toward(u, pos, 1, ev)
+		var dir := _dir_to(u.pos, pos)
+		u.dir = dir
+		ev.append({"t": "face", "id": u.id, "dir": dir})
+		var side := Vector2i(-dir.y, dir.x)
+		for k in range(1, 8):
+			var c: Vector2i = u.pos + dir * k
+			if not walkable_tile(c):
+				break
+			for sdx in [-1, 0, 1]:
+				var p: Vector2i = c + side * sdx
+				if walkable_tile(p) and (k > 1 or sdx == 0 or true):
+					tiles.append(p)
+	u.pending = tiles
+	u.pkind = kind
+	ev.append({"t": "warn", "id": u.id, "tiles": tiles, "kind": kind})
+
+
+## 次の敵のターンに攻撃が来るマス
+func danger() -> Dictionary:
+	var out := {}
+	for u in enemies():
+		if u.move == "boss":
+			for p in u.pending:
+				out[p] = true
+	return out
 
 
 func _patrol(u: Dictionary, ev: Array) -> void:

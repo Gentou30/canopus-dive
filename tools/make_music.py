@@ -437,6 +437,25 @@ def bgm_rest():
     return master(s, 0.5, 2.8)
 
 
+def bgm_boss():
+    """海竜戦：星を守る竜。E マイナー・132BPM・16小節。マリンバの刻みと太い低音で急かす"""
+    s = Song(132, 16)
+    chs = chord_names("E3 B3 G4|C3 G3 E4|D3 A3 F#4|B2 F#3 D#4|"
+                      "E3 B3 G4|A2 E3 C4|C3 G3 E4|B2 F#3 D#4")
+    roots = ["E1", "C1", "D1", "B0", "E1", "A0", "C1", "B0"]
+    for rep in range(2):
+        pads(s, chs, rep * 8, vol=0.75, bright=2200)
+        arps(s, marimba, chs, rep * 8, [0, 1, 2, 1, 0, 2, 1, 2], 0.5, 0.55, -0.3, octave=2)
+        bass_roots(s, roots, rep * 8, (0, 1.5, 2.5, 3.5), 1.0, 0.45)
+    perc(s, "K---s-K-K-s-K-sS", 16, 0, 0.9)
+    perc(s, "----w-------w-w-", 16, 0, 0.5)
+    mel = ("B5:1.5 A5:.5 G5:1 F#5:1 | E5:2 G5:2 | F#5:1 A5:1 D6:1.5 C6:.5 | B5:4 | "
+           "B5:1 E6:1 D6:1 B5:1 | C6:2 A5:2 | G5:1 B5:1 E6:1.5 F#6:.5 | D#6:4")
+    s.line(flute, mel.replace("|", ""), 32, 0.2, 0.4, 0.85)
+    s.line(celesta, "E6:2 B6:2 E6:2 B6:2 D6:2 A6:2 F#6:2 D#6:2", 0, 0.45, 0.6, 0.45)
+    return master(s, 0.35, 1.8)
+
+
 def jingle(beats_len, bpm, build, wet=0.4, rt=2.2):
     s = Song(bpm, 1)
     s.n = int(beats_len * s.beat * SR)
@@ -470,7 +489,7 @@ def jingle_faint():
 def main():
     for name, fn in [("bgm_title", bgm_title), ("bgm_shallow", bgm_shallow), ("bgm_mid", bgm_mid),
                      ("bgm_deep", bgm_deep), ("bgm_rest", bgm_rest),
-                     ("jingle_surface", jingle_surface), ("jingle_faint", jingle_faint)]:
+                     ("jingle_surface", jingle_surface), ("jingle_faint", jingle_faint), ("bgm_boss", bgm_boss)]:
         save(name, fn())
 
 

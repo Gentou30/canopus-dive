@@ -13,13 +13,15 @@ const ROCK_COLORS := [
 	[Color(0.55, 0.38, 0.42), Color(0.95, 0.62, 0.62)],   # さんご礁：ピンクがかった岩
 	[Color(0.42, 0.45, 0.5), Color(0.7, 0.74, 0.72)],     # 遺跡：灰色の石
 	[Color(0.18, 0.2, 0.3), Color(0.35, 0.4, 0.6)],       # 深海：黒い岩
+	[Color(0.2, 0.16, 0.32), Color(0.45, 0.38, 0.7)],     # 最深部：星明かりの紫
 ]
 const SAND_COLORS := [
 	[Color(0.78, 0.7, 0.54), Color(0.72, 0.64, 0.49)],
 	[Color(0.6, 0.62, 0.6), Color(0.55, 0.57, 0.56)],
 	[Color(0.3, 0.33, 0.45), Color(0.27, 0.3, 0.42)],
+	[Color(0.33, 0.3, 0.48), Color(0.29, 0.26, 0.44)],
 ]
-const FOG := [Color(0.1, 0.45, 0.62), Color(0.05, 0.22, 0.38), Color(0.02, 0.06, 0.16)]
+const FOG := [Color(0.1, 0.45, 0.62), Color(0.05, 0.22, 0.38), Color(0.02, 0.06, 0.16), Color(0.05, 0.03, 0.14)]
 
 var t: Tactics
 var zone := 0
@@ -39,6 +41,11 @@ var _cone_mesh: MeshInstance3D
 var _hi_mesh: MeshInstance3D
 var _hi_mat: StandardMaterial3D
 var _sel_mesh: MeshInstance3D
+var _danger_mesh: MeshInstance3D
+var _danger_mat: StandardMaterial3D
+var _rocks := []           # [{mi, corners, center, deco, faded}] カメラとキャラの間に入ったら半透明にする
+var _rock_mat: ShaderMaterial
+var _rock_fade: ShaderMaterial
 var _press := Vector2.ZERO
 var _pressing := false
 var _dragged := false
@@ -75,6 +82,7 @@ func setup(tac: Tactics, z: int) -> void:
 		_map.queue_free()
 	_units.clear()
 	_items.clear()
+	_rocks.clear()
 	_map = Node3D.new()
 	_root.add_child(_map)
 	_build_env()
@@ -99,6 +107,10 @@ func setup(tac: Tactics, z: int) -> void:
 	_sel_mesh = MeshInstance3D.new()
 	_sel_mesh.material_override = _overlay_mat()
 	_map.add_child(_sel_mesh)
+	_danger_mesh = MeshInstance3D.new()
+	_danger_mat = _overlay_mat()
+	_danger_mesh.material_override = _danger_mat
+	_map.add_child(_danger_mesh)
 	yaw = 0.0
 	focus = _cell3(t.me().pos) + Vector3(0, 0, 2.5)
 	_clamp_focus()
@@ -110,7 +122,10 @@ func _process(delta: float) -> void:
 	_shake = maxf(_shake - delta * 3.0, 0.0)
 	if _hi_mat:
 		_hi_mat.albedo_color = Color(1, 1, 1, 0.75 + 0.25 * sin(_time * 5.0))
+	if _danger_mat:
+		_danger_mat.albedo_color = Color(1, 1, 1, 0.55 + 0.45 * absf(sin(_time * 6.0)))
 	_place_camera()
+	_fade_rocks()
 	# ドット絵の向き：画面の右を向いているか
 	var right := _cam.global_transform.basis.x
 	for id in _units:
@@ -145,8 +160,8 @@ func _build_env() -> void:
 	env.background_mode = Environment.BG_COLOR
 	env.background_color = FOG[zone]
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = [Color(0.55, 0.75, 0.85), Color(0.45, 0.55, 0.7), Color(0.35, 0.4, 0.65)][zone]
-	env.ambient_light_energy = [0.75, 0.65, 0.6][zone]
+	env.ambient_light_color = [Color(0.55, 0.75, 0.85), Color(0.45, 0.55, 0.7), Color(0.35, 0.4, 0.65), Color(0.5, 0.42, 0.75)][zone]
+	env.ambient_light_energy = [0.75, 0.65, 0.6, 0.65][zone]
 	env.fog_enabled = true
 	env.fog_mode = Environment.FOG_MODE_DEPTH
 	env.fog_light_color = FOG[zone]
@@ -159,8 +174,8 @@ func _build_env() -> void:
 	_map.add_child(we)
 	var sun := DirectionalLight3D.new()
 	sun.rotation = Vector3(deg_to_rad(-60), deg_to_rad(30), 0)
-	sun.light_color = [Color(1.0, 0.97, 0.88), Color(0.8, 0.9, 1.0), Color(0.6, 0.7, 1.0)][zone]
-	sun.light_energy = [1.0, 0.75, 0.5][zone]
+	sun.light_color = [Color(1.0, 0.97, 0.88), Color(0.8, 0.9, 1.0), Color(0.6, 0.7, 1.0), Color(1.0, 0.85, 0.6)][zone]
+	sun.light_energy = [1.0, 0.75, 0.5, 0.55][zone]
 	_map.add_child(sun)
 
 
@@ -177,7 +192,7 @@ func _build_terrain() -> void:
 	fm.shader = _shader("floor")
 	fm.set_shader_parameter("col_a", SAND_COLORS[zone][0])
 	fm.set_shader_parameter("col_b", SAND_COLORS[zone][1])
-	fm.set_shader_parameter("caustic", [0.28, 0.18, 0.08][zone])
+	fm.set_shader_parameter("caustic", [0.28, 0.18, 0.08, 0.12][zone])
 	floor_mi.material_override = fm
 	_map.add_child(floor_mi)
 	# まわりの海底（暗くして霧に溶かす）
@@ -197,9 +212,14 @@ func _build_terrain() -> void:
 	rmat.shader = _shader("rock")
 	rmat.set_shader_parameter("side_col", ROCK_COLORS[zone][0])
 	rmat.set_shader_parameter("top_col", ROCK_COLORS[zone][1])
+	_rock_mat = rmat
+	_rock_fade = ShaderMaterial.new()
+	_rock_fade.shader = _shader("rock_fade")
+	_rock_fade.set_shader_parameter("side_col", ROCK_COLORS[zone][0])
+	_rock_fade.set_shader_parameter("top_col", ROCK_COLORS[zone][1])
 	var wmat := ShaderMaterial.new()
 	wmat.shader = _shader("weed")
-	wmat.set_shader_parameter("col", [Color(0.25, 0.75, 0.35), Color(0.3, 0.6, 0.4), Color(0.3, 0.45, 0.7)][zone])
+	wmat.set_shader_parameter("col", [Color(0.25, 0.75, 0.35), Color(0.3, 0.6, 0.4), Color(0.3, 0.45, 0.7), Color(0.55, 0.4, 0.8)][zone])
 	var coral: Texture2D = load("res://assets/images/obj/coral.png")
 	for p in t.all_cells():
 		var c := _cell3(p)
@@ -216,11 +236,19 @@ func _build_terrain() -> void:
 					rm.rotation.y = rng.randf_range(-0.12, 0.12)
 				rm.material_override = rmat
 				_map.add_child(rm)
+				var deco: Node3D = null
 				# 浅瀬の岩にはさんごを生やす
 				if zone == 0 and rng.randf() < 0.45 and coral:
 					var s := _billboard(coral, 0.55)
 					s.position = c + Vector3(rng.randf_range(-0.2, 0.2), h, rng.randf_range(-0.2, 0.2))
 					_map.add_child(s)
+					deco = s
+				var corners := PackedVector3Array()
+				for cx in [-0.5, 0.5]:
+					for cy in [0.0, h]:
+						for cz in [-0.5, 0.5]:
+							corners.append(c + Vector3(cx, cy, cz))
+				_rocks.append({"mi": rm, "corners": corners, "center": c + Vector3(0, h / 2.0, 0), "deco": deco, "faded": false})
 			Tactics.WEED:
 				for k in 5:
 					var blade := MeshInstance3D.new()
@@ -232,6 +260,30 @@ func _build_terrain() -> void:
 					blade.position = c + Vector3(rng.randf_range(-0.34, 0.34), bh / 2.0, rng.randf_range(-0.34, 0.34))
 					blade.rotation.y = rng.randf() * PI
 					_map.add_child(blade)
+	# 最深部：海竜が抱いていた星の光
+	if t.is_boss_stage():
+		var b = t.boss()
+		if b != null:
+			var star := _label3d("★", 220, Color(1, 0.85, 0.35))
+			star.position = _cell3(b.pos) + Vector3(0, 0.6, 0.9)
+			star.no_depth_test = false
+			_map.add_child(star)
+			var tw := star.create_tween().set_loops()
+			tw.tween_property(star, "modulate", Color(1, 0.95, 0.6), 0.8).set_trans(Tween.TRANS_SINE)
+			tw.tween_property(star, "modulate", Color(1, 0.75, 0.25), 0.8).set_trans(Tween.TRANS_SINE)
+			var col := MeshInstance3D.new()
+			var cm := CylinderMesh.new()
+			cm.top_radius = 0.6
+			cm.bottom_radius = 0.6
+			cm.height = 4.0
+			cm.cap_top = false
+			cm.cap_bottom = false
+			col.mesh = cm
+			col.position = star.position + Vector3(0, 1.4, 0)
+			var pm2 := ShaderMaterial.new()
+			pm2.shader = _shader("pillar")
+			col.material_override = pm2
+			_map.add_child(col)
 	# 光の筋（上から差しこむ半透明の板）
 	if zone < 2:
 		var lmat := ShaderMaterial.new()
@@ -296,7 +348,7 @@ func remove_item(p: Vector2i) -> void:
 
 func _add_unit(u: Dictionary) -> void:
 	var kind: String = u.kind
-	var sz: float = {"canopus": 1.45, "same": 1.7, "ankou": 1.4, "kani": 1.35, "kurage": 1.1, "utsubo": 1.35}.get(kind, 1.2)
+	var sz: float = {"canopus": 1.45, "same": 1.7, "ankou": 1.4, "kani": 1.35, "kurage": 1.1, "utsubo": 1.35, "ryu": 2.8}.get(kind, 1.2)
 	var uv := UnitView.new(kind, sz, u.id != 0)
 	uv.position = _cell3(u.pos)
 	uv.facing = u.dir
@@ -330,6 +382,54 @@ func refresh() -> void:
 		for p in t.vision(u):
 			quads.append([p, col])
 	_cone_mesh.mesh = _quads(quads, 0.015, 0.02)
+
+
+## 海竜の攻撃が来るマス（赤く点滅）
+func set_danger(cells: Array) -> void:
+	var quads := []
+	for p in cells:
+		quads.append([p, Color(1.0, 0.05, 0.1, 0.7)])
+	_danger_mesh.mesh = _quads(quads, 0.06, 0.03)
+
+
+## カメラとキャラの間にある岩を半透明にする（キャラが隠れないように）
+func _fade_rocks() -> void:
+	if _rocks.is_empty() or t == null:
+		return
+	var targets := []
+	for id in _units:
+		if id < 0:
+			continue
+		var uv: UnitView = _units[id]
+		if not is_instance_valid(uv):
+			continue
+		var foot := _cam.unproject_position(uv.position)
+		var head := _cam.unproject_position(uv.position + Vector3(0, uv.height, 0))
+		var w := absf(foot.y - head.y) * 0.3
+		var depth := (uv.position - _cam.global_position).dot(-_cam.global_transform.basis.z)
+		targets.append([Rect2(foot.x - w, head.y, w * 2, foot.y - head.y), depth])
+	for r in _rocks:
+		var rect := Rect2()
+		var first := true
+		for v in r.corners:
+			var sp := _cam.unproject_position(v)
+			if first:
+				rect = Rect2(sp, Vector2.ZERO)
+				first = false
+			else:
+				rect = rect.expand(sp)
+		var rd: float = (r.center - _cam.global_position).dot(-_cam.global_transform.basis.z)
+		var fade := false
+		for tg in targets:
+			if rd < tg[1] - 0.2 and rect.intersects(tg[0]):
+				fade = true
+				break
+		if fade != r.faded:
+			r.faded = fade
+			var mi: MeshInstance3D = r.mi
+			mi.material_override = _rock_fade if fade else _rock_mat
+			if r.deco != null:
+				(r.deco as Node3D).visible = not fade
 
 
 ## 選べるマスを光らせる。cells: {マス: 色}
@@ -706,6 +806,23 @@ void fragment() {
 	ROUGHNESS = 0.95;
 }
 """
+		"rock_fade":
+			s.code = """
+shader_type spatial;
+render_mode depth_draw_never, cull_back;
+uniform vec3 side_col : source_color;
+uniform vec3 top_col : source_color;
+varying vec3 wnrm;
+void vertex() {
+	wnrm = (MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz;
+}
+void fragment() {
+	float top = smoothstep(0.5, 0.9, wnrm.y);
+	ALBEDO = mix(side_col, top_col, top);
+	ALPHA = 0.28;
+	ROUGHNESS = 0.95;
+}
+"""
 		"weed":
 			s.code = """
 shader_type spatial;
@@ -855,8 +972,11 @@ class UnitView extends Node3D:
 
 	func set_info(hp: int, max_hp: int, state: String, stun: int) -> void:
 		var hearts := ""
-		for i in max_hp:
-			hearts += "●" if i < hp else "○"
+		if max_hp > 8:
+			hearts = "体力 %d/%d" % [hp, max_hp]
+		else:
+			for i in max_hp:
+				hearts += "●" if i < hp else "○"
 		info.text = hearts
 		info.modulate = Color(1, 0.45, 0.45) if state == "alert" else Color(1, 0.9, 0.85)
 		if stun > 0:
@@ -865,6 +985,8 @@ class UnitView extends Node3D:
 			set_mark("！", Color(1, 0.3, 0.25))
 		elif state in ["invest", "search"]:
 			set_mark("？", Color(1, 0.85, 0.3))
+		elif state == "sleep":
+			set_mark("zzz", Color(0.7, 0.85, 1.0))
 		else:
 			set_mark("", Color.WHITE)
 

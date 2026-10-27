@@ -19,8 +19,8 @@ func _init() -> void:
 		args.append("-1")
 	var reach := {}
 	var clears := 0
-	var turns := [0, 0, 0, 0]
-	var tcnt := [0, 0, 0, 0]
+	var turns := [0, 0, 0, 0, 0]
+	var tcnt := [0, 0, 0, 0, 0]
 	var spots := 0
 	var kills := 0
 	var t0 := Time.get_ticks_msec()
@@ -34,10 +34,10 @@ func _init() -> void:
 			turns[s] += r.turns[s]
 			tcnt[s] += 1
 	var s := PackedStringArray()
-	for k in [1, 2, 3]:
+	for k in [1, 2, 3, 4]:
 		s.append("%d階:%d" % [k, reach.get(k, 0)])
 	var ts := PackedStringArray()
-	for k in [1, 2, 3]:
+	for k in [1, 2, 3, 4]:
 		if tcnt[k] > 0:
 			ts.append("%d階%.1fターン" % [k, turns[k] / float(tcnt[k])])
 	print("クリア %d/%d  最後の階 %s  %s  見つかった%.1f回 倒した%.1f体/ラン (%.1fs)" % [clears, n, " ".join(s),
@@ -115,6 +115,28 @@ func _choose(t: Tactics) -> Dictionary:
 			return {"card": k, "card_id": id, "as_move": false, "at": pos}
 	if t.plays_left <= 0:
 		return {}
+	var danger := t.danger()
+	# 海竜の予告を気絶で取り消す
+	var b = t.boss()
+	if b != null and not b.pending.is_empty():
+		for k in t.hand.size():
+			var id: String = t.hand[k]
+			if id == "sonar" and _dist(b.pos, pos) <= 2:
+				return {"card": k, "card_id": id, "as_move": false, "at": pos}
+			if id == "bubble" and t.targets(k).has(b.pos) and (b.pos.x == pos.x or b.pos.y == pos.y):
+				return {"card": k, "card_id": id, "as_move": false, "at": b.pos}
+	# 予告されたマスにいたら逃げる
+	if danger.has(pos):
+		var esc := {}
+		var esc_sc := -1e9
+		for k in t.hand.size():
+			for q in t.swim_targets(k):
+				var sc := -float(_dist(q, pos)) - (100.0 if danger.has(q) else 0.0)
+				if sc > esc_sc:
+					esc_sc = sc
+					esc = {"card": k, "card_id": t.hand[k], "as_move": true, "at": q}
+		if not esc.is_empty() and esc_sc > -50:
+			return esc
 	# となりの敵を攻撃
 	for k in t.hand.size():
 		var id: String = t.hand[k]
@@ -129,6 +151,8 @@ func _choose(t: Tactics) -> Dictionary:
 	# 移動：見張られていない所で、ゴール（宝箱か出口）に近い所
 	var goal := _goal(t)
 	var watched := t.watched()
+	for p in t.danger():
+		watched[p] = true
 	var best := {}
 	var best_score := _score(t, pos, goal, watched) + 0.5
 	for k in t.hand.size():
@@ -151,6 +175,9 @@ func _choose(t: Tactics) -> Dictionary:
 func _goal(t: Tactics) -> Vector2i:
 	var pos: Vector2i = t.me().pos
 	var best := Vector2i.ZERO
+	var b = t.boss()
+	if b != null:
+		best = b.pos
 	for p in t.items:
 		if t.items[p] == "exit":
 			best = p
@@ -170,6 +197,8 @@ func _score(t: Tactics, p: Vector2i, goal: Vector2i, watched: Dictionary) -> flo
 	# 足止めが続いたら、見つかってもいいから進む
 	if watched.has(p) and t.tile(p) != Tactics.WEED:
 		sc -= 8.0 if _stall < 2 else 1.0
+	if t.danger().has(p):
+		sc -= 30.0
 	return sc
 
 

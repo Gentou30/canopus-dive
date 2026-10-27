@@ -142,6 +142,27 @@ def main():
     # ぺしっ（ミラが羽ではたく）
     sl = bandpass(noise(0.08), 1500, 7000) * np.exp(-np.arange(int(0.08 * SR)) / SR * 60)
     save("slap", sl)
+    # 3版目：見つかった・ボス
+    sp = silence(0.6)
+    for i, nm in enumerate(["E5", "B5", "E6"]):
+        at(sp, marimba(freq(nm), 0.25, 1.0), i * 0.06)
+    at(sp, sweep(900, 1500, 0.3, 6) * 0.25, 0.15)
+    save("spot", sp)
+    wn = silence(0.7)
+    for i in range(2):
+        at(wn, sweep(330, 300, 0.22, 10) * 0.7 + sweep(660, 600, 0.22, 12) * 0.25, i * 0.28)
+    save("warn", wn)
+    rn = int(1.4 * SR)
+    ro = lowpass(noise(1.4), 700) * np.sin(np.linspace(0, np.pi, rn)) ** 0.7
+    ro = ro + sweep(140, 55, 1.4, 1.5) * 0.9 + sweep(280, 110, 1.4, 2.0) * 0.3
+    save("roar", ro)
+    bn = int(0.9 * SR)
+    br = bandpass(noise(0.9), 400, 5000) * np.sin(np.linspace(0, np.pi, bn)) + sweep(1200, 300, 0.9, 2) * 0.3
+    save("breath", br)
+    sr = silence(1.8)
+    for i, nm in enumerate(["E6", "B6", "E7", "G#7", "B7"]):
+        at(sr, celesta(freq(nm), 1.2, 0.9), i * 0.09)
+    save("star", sr)
 
 
 if __name__ == "__main__":
