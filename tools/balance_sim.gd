@@ -2,254 +2,192 @@ extends SceneTree
 
 ## バランス確認：ボットに潜らせて、どの階まで行けたか・クリア率を数える。
 ## godot --headless -s res://tools/balance_sim.gd -- 回数 [log]
-## ボット：数字から「確実に安全」と分かるマスを先に照らし、勝てる敵は弱い順に倒す。
-## 体力が減ったらレベルアップ（全回復）を使う。手詰まりなら音波、それでもだめなら一番ましなマスに賭ける。
+## ボット：となりに敵がいれば攻撃。いなければ、見張りの視界に入らないマスのうち出口に近い所へ泳ぐ。
+## 宝箱が近ければ寄り道する。空気・体力が減ったら深呼吸・ぎゅっを使う。
 
 static var DEATHS := {}
-static var STUCK := {}
-const PERK_ORDER := ["scale", "sonar", "mira", "greed", "lung", "hunt", "eye", "nose"]
+static var _last_hit := ""
+static var _stall := 0
+const MAX_TURNS := 80
 
 
 func _init() -> void:
 	var args := OS.get_cmdline_user_args()
 	var n := int(args[0]) if args.size() > 0 else 100
 	var log := args.size() > 1
+	if not log:
+		args.append("-1")
 	var reach := {}
 	var clears := 0
-	var lv_sum := [0, 0, 0, 0]
-	var lv_cnt := [0, 0, 0, 0]
-	var gambles := 0
+	var turns := [0, 0, 0, 0]
+	var tcnt := [0, 0, 0, 0]
+	var spots := 0
+	var kills := 0
 	var t0 := Time.get_ticks_msec()
 	for i in n:
-		var r := _run(i, log and i < 3)
-		reach[r.floor] = reach.get(r.floor, 0) + 1
+		var r := _run(i, log and i == int(args[1]))
+		reach[r.stage] = reach.get(r.stage, 0) + 1
 		clears += 1 if r.clear else 0
-		gambles += r.gambles
-		for f in r.lvs:
-			lv_sum[f] += r.lvs[f]
-			lv_cnt[f] += 1
+		spots += r.spots
+		kills += r.kills
+		for s in r.turns:
+			turns[s] += r.turns[s]
+			tcnt[s] += 1
 	var s := PackedStringArray()
 	for k in [1, 2, 3]:
 		s.append("%d階:%d" % [k, reach.get(k, 0)])
-	var lvs := PackedStringArray()
-	for f in [1, 2, 3]:
-		if lv_cnt[f] > 0:
-			lvs.append("%d階末Lv%.1f" % [f, lv_sum[f] / float(lv_cnt[f])])
-	print("クリア %d/%d  倒れた階 %s  %s  賭け%.1f回/ラン  (%.1fs)" % [clears, n, " ".join(s), " ".join(lvs),
-		gambles / float(n), (Time.get_ticks_msec() - t0) / 1000.0])
+	var ts := PackedStringArray()
+	for k in [1, 2, 3]:
+		if tcnt[k] > 0:
+			ts.append("%d階%.1fターン" % [k, turns[k] / float(tcnt[k])])
+	print("クリア %d/%d  最後の階 %s  %s  見つかった%.1f回 倒した%.1f体/ラン (%.1fs)" % [clears, n, " ".join(s),
+		" ".join(ts), spots / float(n), kills / float(n), (Time.get_ticks_msec() - t0) / 1000.0])
 	print("倒れた理由 ", DEATHS)
-	var ks := STUCK.keys()
-	ks.sort_custom(func(a, b): return STUCK[a] > STUCK[b])
-	for k in ks.slice(0, 12):
-		print("  ", k, " x", STUCK[k])
 	quit()
 
 
 func _run(seed_value: int, log: bool) -> Dictionary:
-	var g := Sweep.new(seed_value)
-	var lvs := {}
-	var gambles := 0
+	var t := Tactics.new(seed_value)
+	t.start_stage()
+	var turns := {}
 	while true:
-		g.start_floor()
-		var res := _play_floor(g)
-		gambles += res.gambles
+		var n := 0
+		_stall = 0
+		while not t.exited and t.hp > 0 and n < MAX_TURNS:
+			var before: Vector2i = t.me().pos
+			_turn(t, log)
+			_stall = _stall + 1 if t.me().pos == before else 0
+			if log and _stall == 5:
+				_dump(t)
+			if t.exited or t.hp <= 0:
+				break
+			var ev := t.end_turn()
+			_note(ev)
+			n += 1
+		turns[t.stage] = n
 		if log:
-			print("  %d階 %s Lv%d 体力%d/%d 空気%d" % [g.floor_no, res.end, g.lv, g.hp, g.max_hp, g.air])
-		if res.end == "faint" or res.end == "stuck":
-			return {"floor": g.floor_no, "clear": false, "lvs": lvs, "gambles": gambles}
-		lvs[g.floor_no] = g.lv
-		if res.end == "star":
-			return {"floor": 4, "clear": true, "lvs": lvs, "gambles": gambles}
-		var ch := g.perk_choices()
-		ch.sort_custom(func(a, b): return PERK_ORDER.find(a) < PERK_ORDER.find(b))
-		g.next_floor(ch[0])
+			print("stage %d  turns %d  hp %d air %d spotted %d" % [t.stage, n, t.hp, t.air, t.spotted])
+		if t.hp <= 0 or not t.exited:
+			if not t.exited and t.hp > 0:
+				DEATHS["時間切れ"] = DEATHS.get("時間切れ", 0) + 1
+			return {"stage": t.stage, "clear": false, "turns": turns, "spots": t.spotted_total, "kills": t.kills}
+		if t.cleared:
+			return {"stage": t.stage, "clear": true, "turns": turns, "spots": t.spotted_total, "kills": t.kills}
+		t.add_card(t.reward_choices()[0])
+		t.next_stage()
 	return {}
 
 
-func _apply(g: Sweep, ev: Array) -> String:
+func _note(ev: Array) -> void:
 	for e in ev:
-		if e.t in ["faint", "exit", "star"]:
-			return e.t
-	return ""
+		if e.t == "phit":
+			_last_hit = "空気" if e.air else "敵"
+		if e.t == "faint":
+			DEATHS[_last_hit] = DEATHS.get(_last_hit, 0) + 1
 
 
-func _play_floor(g: Sweep) -> Dictionary:
-	var gambles := 0
-	for step in 400:
-		var act := _choose(g)
-		var ev: Array
-		match act[0]:
-			"tap":
-				ev = g.tap(act[1])
-				if act.size() > 2:
-					gambles += 1
-			"level":
-				ev = g.level_up()
-			"item":
-				ev = g.use_item(act[1])
-			"sonar":
-				ev = g.sonar(act[1])
-			"mira":
-				ev = g.mira_hint(act[1])
-			_:
-				var hidden := 0
-				for q in g.all_cells():
-					if not g.cell(q).seen:
-						hidden += 1
-				var key := "詰み f%d 体力%d/%d Lv%d xp%d/%d 未照らし%d" % [g.floor_no, g.hp, g.max_hp, g.lv, g.xp, g.xp_need(), hidden / 5 * 5]
-				STUCK[key] = STUCK.get(key, 0) + 1
-				return {"end": "stuck", "gambles": gambles}
-		var r := _apply(g, ev)
-		if r == "faint":
-			var why: String = "賭け" if act.size() > 2 else str(act[0])
-			for e in ev:
-				if e.t == "drown":
-					why = "空気"
-				if e.t == "fight":
-					why += "(強さ%d 体力%d/%d Lv%d)" % [e.lv, g.hp + e.dmg, g.max_hp, g.lv] if g.floor_no == 3 and e.lv >= 9 else ""
-			DEATHS[why] = DEATHS.get(why, 0) + 1
-		if r != "":
-			return {"end": r, "gambles": gambles}
-	return {"end": "stuck", "gambles": gambles}
+func _turn(t: Tactics, log: bool) -> void:
+	for guard in 8:
+		if t.exited or t.hp <= 0 or t.hand.is_empty():
+			return
+		var c := _choose(t)
+		if c.is_empty():
+			return
+		var ev := t.play(c.card, c.as_move, c.at)
+		_note(ev)
+		if ev.any(func(e): return e.t == "chest"):
+			t.add_card(t.reward_choices()[0])
+		if log:
+			print("  ", Cards.def(c.card_id).name, " (泳ぐ)" if c.as_move else "", " ", c.at, " hp", t.hp, " air", t.air)
 
 
-## 照らしていないマスの強さの上限（まわりの数字から）。手がかりがなければ 99
-func _bound(g: Sweep, q: Vector2i) -> int:
-	var c := g.cell(q)
-	if c.hint == "safe" or c.hint == "item" or c.hint == "exit":
-		return 0
-	if c.hint.begins_with("lv"):
-		return int(c.hint.substr(2))
-	var b := 99
-	for n in g.neighbors(q):
-		var d := g.cell(n)
-		if not g.is_open(n) or (d.item != "" and not d.taken and d.item != "exit"):
+func _choose(t: Tactics) -> Dictionary:
+	var pos: Vector2i = t.me().pos
+	for k in t.hand.size():
+		if not t.can_play(k):
 			continue
-		var known := 0
-		for m in g.neighbors(n):
-			var e := g.cell(m)
-			if e.seen and e.enemy > 0 and e.alive:
-				known += e.enemy
-		b = mini(b, g.number(n) - known)
-	return b
-
-
-func _choose(g: Sweep) -> Array:
-	if g.air <= 0 and g.items.bottle > 0:
-		return ["item", "bottle"]
-	# 空気が少ないときは出口へ（最後の階は海竜へ）
-	var goal := Vector2i(-1, -1)
-	for p in g.all_cells():
-		var c := g.cell(p)
-		if (c.item == "exit") or (c.enemy == 10 and c.alive):
-			goal = p
-	var dist_goal := 99
-	if goal.x >= 0:
-		for p in g.all_cells():
-			if g.is_open(p):
-				dist_goal = mini(dist_goal, maxi(absi(p.x - goal.x), absi(p.y - goal.y)))
-	if g.floor_no < Sweep.FLOORS and g.air <= dist_goal + 2:
-		if g.reachable(goal):
-			return ["tap", goal]
-		var best_p := Vector2i(-1, -1)
-		var best_s := 999
-		for p in g.all_cells():
-			if g.cell(p).seen or not g.reachable(p):
-				continue
-			var b := _bound(g, p)
-			if b >= g.hp:
-				continue
-			var s := maxi(absi(p.x - goal.x), absi(p.y - goal.y)) * 10 + mini(b, 9)
-			if s < best_s:
-				best_s = s
-				best_p = p
-		if best_p.x >= 0:
-			return ["tap", best_p, "gamble"] if _bound(g, best_p) > 0 else ["tap", best_p]
-	# 物を拾う
-	for p in g.all_cells():
-		var c := g.cell(p)
-		if c.seen and c.item != "" and not c.taken and c.item != "exit" and g.reachable(p):
-			return ["tap", p]
-	# 確実に安全なマス
-	var frontier := []
-	for p in g.all_cells():
-		if not g.cell(p).seen and g.reachable(p):
-			frontier.append(p)
-	for p in frontier:
-		if _bound(g, p) == 0 and g.cell(p).hint != "exit":
-			if g.air <= 0 and g.items.bottle > 0:
-				return ["item", "bottle"]
-			return ["tap", p]
-	# まわりの未照らしが1マスだけの数字 → そのマスの強さがぴったり分かる
-	for p in frontier:
-		var ex := _exact(g, p)
-		if ex > 0 and ex < g.hp and g.cell(p).hint != "exit":
-			return ["tap", p]
-	# 見えている敵で勝てるもの（弱い順）
-	var foes := []
-	for p in g.all_cells():
-		var c := g.cell(p)
-		if c.seen and c.enemy > 0 and c.alive and g.reachable(p):
-			foes.append(p)
-	foes.sort_custom(func(a, b): return g.cell(a).enemy < g.cell(b).enemy)
-	for p in foes:
-		if g.cell(p).enemy < g.hp:
-			return ["tap", p]
-	# 回復（レベルアップの全回復は、体力が少ないときまで取っておく）
-	if g.can_level_up() and g.hp <= max(2, g.max_hp / 3):
-		return ["level"]
-	if g.items.pearl > 0 and g.hp <= g.max_hp - 3:
-		return ["item", "pearl"]
-	for p in foes:
-		if g.cell(p).enemy < g.hp:
-			return ["tap", p]
-	# 手がかりがないなら音波・ミラ
-	var best: Variant = null
-	var bb := 999
-	for p in frontier:
-		if g.cell(p).hint == "exit":
+		var id: String = t.hand[k]
+		if id == "wing":
+			return {"card": k, "card_id": id, "as_move": false, "at": pos}
+		if id == "breath" and t.air < 10:
+			return {"card": k, "card_id": id, "as_move": false, "at": pos}
+		if id == "hug" and t.hp <= t.max_hp - 5:
+			return {"card": k, "card_id": id, "as_move": false, "at": pos}
+	if t.plays_left <= 0:
+		return {}
+	# となりの敵を攻撃
+	for k in t.hand.size():
+		var id: String = t.hand[k]
+		var d := Cards.def(id)
+		if d.kind != "atk" or d.target == "self":
 			continue
-		var b := _bound(g, p)
-		if b < bb:
-			bb = b
+		var tg := t.targets(k)
+		for p in tg:
+			var u = t.unit_at(p)
+			if u != null and u.id != 0 and _dist(p, pos) <= 2:
+				return {"card": k, "card_id": id, "as_move": false, "at": p}
+	# 移動：見張られていない所で、ゴール（宝箱か出口）に近い所
+	var goal := _goal(t)
+	var watched := t.watched()
+	var best := {}
+	var best_score := _score(t, pos, goal, watched) + 0.5
+	for k in t.hand.size():
+		var id: String = t.hand[k]
+		var d := Cards.def(id)
+		var opts := [[t.swim_targets(k), true]]
+		if d.target == "move":
+			opts.append([t.targets(k), false])
+		for o in opts:
+			for p in o[0]:
+				var sc := _score(t, p, goal, watched)
+				if o[1] and d.kind == "atk" and _stall < 1:
+					sc -= 1.5
+				if sc > best_score:
+					best_score = sc
+					best = {"card": k, "card_id": id, "as_move": o[1], "at": p}
+	return best
+
+
+func _goal(t: Tactics) -> Vector2i:
+	var pos: Vector2i = t.me().pos
+	var best := Vector2i.ZERO
+	for p in t.items:
+		if t.items[p] == "exit":
 			best = p
-	if g.sonar_left > 0 and frontier.size() > 0 and bb >= g.hp:
-		return ["sonar", frontier[g.rng.randi_range(0, frontier.size() - 1)]]
-	if g.mira_left > 0 and best != null and bb >= 2:
-		return ["mira", best]
-	# 出口が見えていれば出る
-	if g.floor_no < Sweep.FLOORS:
-		for p in g.all_cells():
-			if g.cell(p).item == "exit" and g.reachable(p):
-				return ["tap", p]
-	if best != null and bb < g.hp:
-		return ["tap", best, "gamble"]
-	if g.can_level_up():
-		return ["level"]
-	if best != null and bb < 99:
-		return ["tap", best, "gamble"]
-	# 出口がまだ見えていない：一番手がかりのないマスに賭ける
-	if best != null:
-		return ["tap", best, "gamble"]
-	return ["stuck"]
+	var bd := 999
+	for p in t.items:
+		if t.items[p] in ["chest", "vent", "pearl"]:
+			var dd := t._path(pos, p, false).size()
+			if dd > 0 and dd < bd and dd <= 6:
+				bd = dd
+				best = p
+	return best
 
 
-## 隣の数字のうち、未照らしのマスが q だけのものがあれば、q の強さが分かる（-1 なら不明）
-func _exact(g: Sweep, q: Vector2i) -> int:
-	for n in g.neighbors(q):
-		if not g.is_open(n):
-			continue
-		var d := g.cell(n)
-		if d.item != "" and not d.taken and d.item != "exit":
-			continue
-		var hidden := 0
-		var known := 0
-		for m in g.neighbors(n):
-			var e := g.cell(m)
-			if not e.seen:
-				hidden += 1
-			elif e.enemy > 0 and e.alive:
-				known += e.enemy
-		if hidden == 1:
-			return g.number(n) - known
-	return -1
+func _score(t: Tactics, p: Vector2i, goal: Vector2i, watched: Dictionary) -> float:
+	var d := t._path(p, goal, false).size() if p != goal else 0
+	var sc := -float(d)
+	# 足止めが続いたら、見つかってもいいから進む
+	if watched.has(p) and t.tile(p) != Tactics.WEED:
+		sc -= 8.0 if _stall < 2 else 1.0
+	return sc
+
+
+func _dist(a: Vector2i, b: Vector2i) -> int:
+	return abs(a.x - b.x) + abs(a.y - b.y)
+
+
+func _dump(t: Tactics) -> void:
+	for y in Tactics.H:
+		var row := ""
+		for x in Tactics.W:
+			var p := Vector2i(x, y)
+			var u = t.unit_at(p)
+			if u != null:
+				row += "C" if u.id == 0 else u.kind[0].to_upper()
+			elif t.items.has(p):
+				row += t.items[p][0]
+			else:
+				row += [".", "#", "w"][t.tile(p)]
+		print(row)
+	print(t.hand, " goal ", _goal(t))
