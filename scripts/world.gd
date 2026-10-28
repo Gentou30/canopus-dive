@@ -4,6 +4,9 @@ extends SubViewportContainer
 ## 3D の海底マップ（HD-2D 風）。地形は箱の 3D、キャラはドット絵の板（Sprite3D）を立てる。
 ## マス (x, y) は 3D の (x, 0, y)。床の上面が y=0。
 ## 操作：タップでマスを選ぶ（cell_tapped）／ドラッグでカメラを動かす／rotate_view で 90° 回す。
+##   タップは床のマスを優先する（光っている＝選べるマスなら、キャラや岩の後ろでも選べる）。
+##   光っていないマスをキャラの絵の上で押したときだけ、そのキャラのマスにする。
+##   マウスでは、指しているマスに枠を出す（岩の陰でも見える）。
 ## 演出は game.gd から呼ぶ（move_unit などは Tween を返すので await できる）。
 
 signal cell_tapped(p: Vector2i)
@@ -43,6 +46,10 @@ var _hi_mat: StandardMaterial3D
 var _sel_mesh: MeshInstance3D
 var _danger_mesh: MeshInstance3D
 var _danger_mat: StandardMaterial3D
+var _hover_mesh: MeshInstance3D
+var _hover := Vector2i(-1, -1)
+var _pickable := {}        # 光っているマス（タップで優先する）
+var _mouse := Vector2(-1, -1)
 var _rocks := []           # [{mi, corners, center, deco, faded}] カメラとキャラの間に入ったら半透明にする
 var _rock_mat: ShaderMaterial
 var _rock_fade: ShaderMaterial
@@ -111,6 +118,14 @@ func setup(tac: Tactics, z: int) -> void:
 	_danger_mat = _overlay_mat()
 	_danger_mesh.material_override = _danger_mat
 	_map.add_child(_danger_mesh)
+	_hover_mesh = MeshInstance3D.new()
+	var hm := _overlay_mat()
+	hm.no_depth_test = true
+	hm.render_priority = 3
+	_hover_mesh.material_override = hm
+	_map.add_child(_hover_mesh)
+	_hover = Vector2i(-1, -1)
+	_pickable = {}
 	yaw = 0.0
 	focus = _cell3(t.me().pos) + Vector3(0, 0, 2.5)
 	_clamp_focus()
@@ -305,8 +320,8 @@ func _add_item(p: Vector2i, kind: String) -> void:
 	n.position = _cell3(p)
 	_map.add_child(n)
 	_items[p] = n
-	var tex: Texture2D = load("res://assets/images/obj/%s.png" % kind)
-	var sz: float = {"chest": 0.75, "pearl": 0.45, "vent": 0.7, "exit": 0.9}.get(kind, 0.6)
+	var tex: Texture2D = load("res://assets/images/obj/%s.png" % ("chest" if kind == "gchest" else kind))
+	var sz: float = {"chest": 0.75, "gchest": 0.85, "pearl": 0.45, "vent": 0.7, "exit": 0.9, "coin": 0.5}.get(kind, 0.6)
 	if kind == "exit":
 		# 出口：光の柱
 		var col := MeshInstance3D.new()
@@ -330,7 +345,13 @@ func _add_item(p: Vector2i, kind: String) -> void:
 		var s := _billboard(tex, sz)
 		s.position.y = 0.04 if kind != "pearl" else 0.15
 		n.add_child(s)
-		if kind == "pearl" or kind == "chest":
+		if kind == "gchest":
+			# 金の宝箱：金色に光る
+			s.modulate = Color(1.0, 0.85, 0.35)
+			var star := _label3d("★", 90, UiStyle.GOLD)
+			star.position.y = 1.1
+			n.add_child(star)
+		if kind in ["pearl", "chest", "gchest", "coin"]:
 			var tw := s.create_tween().set_loops()
 			tw.tween_property(s, "position:y", s.position.y + 0.12, 0.9).set_trans(Tween.TRANS_SINE)
 			tw.tween_property(s, "position:y", s.position.y, 0.9).set_trans(Tween.TRANS_SINE)
@@ -346,14 +367,23 @@ func remove_item(p: Vector2i) -> void:
 		tw.tween_callback(n.queue_free)
 
 
-func _add_unit(u: Dictionary) -> void:
+func add_unit(u: Dictionary) -> UnitView:
+	return _add_unit(u)
+
+
+func _add_unit(u: Dictionary) -> UnitView:
 	var kind: String = u.kind
-	var sz: float = {"canopus": 1.45, "same": 1.7, "ankou": 1.4, "kani": 1.35, "kurage": 1.1, "utsubo": 1.35, "ryu": 2.8}.get(kind, 1.2)
+	var sz: float = {"canopus": 1.45, "same": 1.7, "ankou": 1.4, "kani": 1.35, "kurage": 1.1, "utsubo": 1.35, "ryu": 2.8,
+		"ika": 1.35, "tako": 1.2, "ei": 1.6, "uni": 1.0}.get(kind, 1.2)
+	if u.get("elite", false):
+		sz *= 1.25
 	var uv := UnitView.new(kind, sz, u.id != 0)
+	uv.elite = u.get("elite", false)
 	uv.position = _cell3(u.pos)
 	uv.facing = u.dir
 	_map.add_child(uv)
 	_units[u.id] = uv
+	return uv
 
 
 func view(id: int) -> UnitView:
@@ -408,6 +438,14 @@ func _fade_rocks() -> void:
 		var w := absf(foot.y - head.y) * 0.3
 		var depth := (uv.position - _cam.global_position).dot(-_cam.global_transform.basis.z)
 		targets.append([Rect2(foot.x - w, head.y, w * 2, foot.y - head.y), depth])
+	# マウスで指しているマスも見えるように
+	if t.inside(_hover):
+		var c := _cell3(_hover)
+		var a := _cam.unproject_position(c + Vector3(-0.5, 0, -0.5))
+		var r2 := Rect2(a, Vector2.ZERO)
+		for v in [Vector3(0.5, 0, -0.5), Vector3(0.5, 0, 0.5), Vector3(-0.5, 0, 0.5)]:
+			r2 = r2.expand(_cam.unproject_position(c + v))
+		targets.append([r2, (c - _cam.global_position).dot(-_cam.global_transform.basis.z)])
 	for r in _rocks:
 		var rect := Rect2()
 		var first := true
@@ -432,8 +470,34 @@ func _fade_rocks() -> void:
 				(r.deco as Node3D).visible = not fade
 
 
+## 泡のカーテン：その場に海藻のしげみを生やす
+func add_weed(p: Vector2i) -> void:
+	var wmat := ShaderMaterial.new()
+	wmat.shader = _shader("weed")
+	wmat.set_shader_parameter("col", [Color(0.25, 0.75, 0.35), Color(0.3, 0.6, 0.4), Color(0.3, 0.45, 0.7), Color(0.55, 0.4, 0.8)][zone])
+	var c := _cell3(p)
+	for k in 5:
+		var blade := MeshInstance3D.new()
+		var q := QuadMesh.new()
+		var bh := randf_range(0.7, 1.15)
+		q.size = Vector2(0.22, bh)
+		blade.mesh = q
+		blade.material_override = wmat
+		blade.position = c + Vector3(randf_range(-0.34, 0.34), bh / 2.0, randf_range(-0.34, 0.34))
+		blade.rotation.y = randf() * PI
+		blade.scale = Vector3(1, 0.01, 1)
+		_map.add_child(blade)
+		var tw := blade.create_tween()
+		tw.tween_interval(k * 0.05)
+		tw.tween_property(blade, "scale", Vector3.ONE, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+
+
 ## 選べるマスを光らせる。cells: {マス: 色}
 func set_highlight(cells: Dictionary) -> void:
+	_pickable = cells
+	if _mouse.x >= 0:
+		_hover = Vector2i(-9, -9)
+		_set_hover(cell_at(_mouse))
 	var quads := []
 	for p in cells:
 		quads.append([p, cells[p]])
@@ -445,6 +509,30 @@ func set_selected(cells: Array, col: Color) -> void:
 	for p in cells:
 		quads.append([p, col])
 	_sel_mesh.mesh = _quads(quads, 0.045, 0.16)
+
+
+## マウスで指しているマスの枠
+func _set_hover(p: Vector2i) -> void:
+	if p == _hover:
+		return
+	_hover = p
+	if not t.inside(p):
+		_hover_mesh.mesh = null
+		return
+	var col := Color(1, 0.95, 0.5, 0.95) if _pickable.has(p) else Color(1, 1, 1, 0.55)
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var c := _cell3(p) + Vector3(0, 0.05, 0)
+	var o := 0.48
+	var i := 0.38
+	var outer := [Vector3(-o, 0, -o), Vector3(o, 0, -o), Vector3(o, 0, o), Vector3(-o, 0, o)]
+	var inner := [Vector3(-i, 0, -i), Vector3(i, 0, -i), Vector3(i, 0, i), Vector3(-i, 0, i)]
+	for k in 4:
+		var n := (k + 1) % 4
+		for v in [outer[k], outer[n], inner[n], outer[k], inner[n], inner[k]]:
+			st.set_color(col)
+			st.add_vertex(c + v)
+	_hover_mesh.mesh = st.commit()
 
 
 func _quads(list: Array, y: float, inset: float) -> ArrayMesh:
@@ -507,8 +595,26 @@ func _clamp_focus() -> void:
 	focus = _clamped(focus)
 
 
-## 画面の点 → マス。キャラの絵の上を押したら、そのキャラのマス
+## 画面の点 → マス。床のマスを優先し、光っていないマスをキャラの絵の上で押したときだけ、そのキャラのマス
 func cell_at(screen: Vector2) -> Vector2i:
+	var ground := _ground_cell(screen)
+	if _pickable.has(ground):
+		return ground
+	var sprite := _sprite_cell(screen)
+	return sprite if t.inside(sprite) else ground
+
+
+func _ground_cell(screen: Vector2) -> Vector2i:
+	var o := _cam.project_ray_origin(screen)
+	var d := _cam.project_ray_normal(screen)
+	if absf(d.y) < 0.001:
+		return Vector2i(-1, -1)
+	var k := -o.y / d.y
+	var hit := o + d * k
+	return Vector2i(roundi(hit.x), roundi(hit.z))
+
+
+func _sprite_cell(screen: Vector2) -> Vector2i:
 	var best := Vector2i(-1, -1)
 	var best_d := 1e9
 	for id in _units:
@@ -523,15 +629,7 @@ func cell_at(screen: Vector2) -> Vector2i:
 			if d < best_d:
 				best_d = d
 				best = t.unit_by_id(id).pos
-	if best.x >= 0:
-		return best
-	var o := _cam.project_ray_origin(screen)
-	var d := _cam.project_ray_normal(screen)
-	if absf(d.y) < 0.001:
-		return Vector2i(-1, -1)
-	var k := -o.y / d.y
-	var hit := o + d * k
-	return Vector2i(roundi(hit.x), roundi(hit.z))
+	return best
 
 
 ## マス → 画面の点（UI の吹き出しなど）
@@ -561,6 +659,10 @@ func _gui_input(e: InputEvent) -> void:
 			dist = clampf(dist - 0.8, 8.0, 18.0)
 		elif mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
 			dist = clampf(dist + 0.8, 8.0, 18.0)
+	elif e is InputEventMouseMotion and not _pressing:
+		_mouse = (e as InputEventMouseMotion).position
+		if t:
+			_set_hover(cell_at(_mouse))
 	elif e is InputEventMouseMotion and _pressing:
 		var mm := e as InputEventMouseMotion
 		if not _dragged and mm.position.distance_to(_press) > 18.0:
@@ -877,6 +979,7 @@ class UnitView extends Node3D:
 	var facing := Vector2i.ZERO
 	var fly := 0.0
 	var hidden_look := false
+	var elite := false
 	var height := 1.0
 	var sprite: Sprite3D
 	var shadow: MeshInstance3D
@@ -940,7 +1043,7 @@ class UnitView extends Node3D:
 		if enemy and frame == 0 and int(_t * 2.2) % 2 == 1:
 			f = 1
 		sprite.frame = f
-		var tint := Color(1, 1, 1)
+		var tint := Color(1, 0.9, 0.6) if elite else Color(1, 1, 1)
 		if _hit > 0:
 			tint = Color(1, 1 - _hit * 0.8, 1 - _hit * 0.8)
 		if hidden_look:
@@ -977,7 +1080,7 @@ class UnitView extends Node3D:
 		else:
 			for i in max_hp:
 				hearts += "●" if i < hp else "○"
-		info.text = hearts
+		info.text = ("ぬし " if elite else "") + hearts
 		info.modulate = Color(1, 0.45, 0.45) if state == "alert" else Color(1, 0.9, 0.85)
 		if stun > 0:
 			set_mark("zz", Color(0.7, 0.85, 1.0))

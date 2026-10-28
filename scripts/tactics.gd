@@ -12,55 +12,104 @@ extends RefCounted
 ##   {t:"spot", id}（見つかった）{t:"hear", id, at}（音を聞いた）{t:"lost", id}（見失った）{t:"calm", id}
 ##   {t:"noise", at}  {t:"hide"}  {t:"shield"}  {t:"heal", n}  {t:"air", n}  {t:"draw", n}  {t:"reshuffle"}
 ##   {t:"pickup", item, at}  {t:"chest", at}  {t:"exit"}  {t:"faint"}  {t:"suffocate"}
+##   {t:"coin", n, at}  {t:"relic", id, at}  {t:"revive"}  {t:"ink", id}  {t:"weed", at}  {t:"resist", id}
+##   {t:"summon", id}  {t:"boss_phase", id}  {t:"warn", id, tiles, kind, name}  {t:"boss_atk", id, kind, tiles}
+## コース（難しさ）は COURSES。お守りは Relics、コインは敵・宝箱・小判の山で手に入り、空気だまりのお店で使う。
 
 const W := 9
 const H := 13
 const DIRS := [Vector2i(0, -1), Vector2i(1, 0), Vector2i(0, 1), Vector2i(-1, 0)]
-const STAGES := 4          # 4階目は海竜の待つ最深部（ボス戦）
-
 const MAX_HP := 12
 const MAX_AIR := 40
 const HAND := 5
 const PLAYS := 2
-const ALERT_RADIUS := 4   # 見つかったとき、仲間に知らせる距離
-const LOSE_TURNS := 2     # 見えない状態がこれだけ続くと見失う
+
+## コース：floors は [見た目の層(0〜3), 敵の並び]。最後の階が海竜（ボス戦）
+##   air/hp 最初の空気・体力  boss_hp/boss_dmg 海竜の体力・攻撃の上乗せ  atk/hp_plus 敵の攻撃・体力の上乗せ
+##   alert 見つかったとき仲間に知らせる距離  lose 見えない状態がこれだけ続くと見失う  elite_from この階から「ぬし」が出る
+##   summon 海竜が怒ったとき呼ぶ子分  double false なら、怒っても攻撃は重ならない
+const COURSES := {
+	"easy": {"name": "あさせコース", "sub": "はじめての人に。4階で海竜", "air": 40, "hp": 12, "boss_hp": 16, "boss_dmg": 0,
+		"atk": 0, "hp_plus": 0, "alert": 4, "lose": 2, "elite_from": 2, "summon": ["fugu"], "double": false,
+		"floors": [
+			[0, ["fugu", "fugu", "ankou", "kurage"]],
+			[1, ["fugu", "ika", "kani", "utsubo", "ankou", "kurage"]],
+			[2, ["same", "kani", "fugu", "tako", "ankou", "utsubo", "kurage"]],
+			[3, ["fugu", "fugu"]],
+		]},
+	"normal": {"name": "しんかいコース", "sub": "敵が多い。5階で怒りっぽい海竜", "air": 38, "hp": 12, "boss_hp": 26, "boss_dmg": 1,
+		"atk": 0, "hp_plus": 0, "alert": 4, "lose": 3, "elite_from": 2, "summon": ["ika", "fugu"],
+		"floors": [
+			[0, ["fugu", "fugu", "ankou", "kurage", "ika"]],
+			[1, ["fugu", "ika", "kani", "utsubo", "ankou", "uni", "kurage"]],
+			[1, ["tako", "kani", "ika", "utsubo", "ankou", "ei", "uni"]],
+			[2, ["same", "ei", "tako", "fugu", "ankou", "utsubo", "uni", "kurage"]],
+			[3, ["fugu", "ika"]],
+		]},
+	"hard": {"name": "ならくコース", "sub": "敵が強い。6階で本気の海竜", "air": 36, "hp": 12, "boss_hp": 32, "boss_dmg": 1,
+		"atk": 1, "hp_plus": 0, "alert": 5, "lose": 3, "elite_from": 1, "summon": ["same", "ika"],
+		"floors": [
+			[0, ["fugu", "ika", "ankou", "kurage", "kani"]],
+			[1, ["fugu", "ika", "kani", "utsubo", "ankou", "uni", "tako"]],
+			[1, ["tako", "kani", "ika", "utsubo", "ankou", "ei", "uni", "fugu"]],
+			[2, ["same", "ei", "tako", "ika", "ankou", "utsubo", "uni", "kurage"]],
+			[2, ["same", "same", "ei", "tako", "ankou", "utsubo", "uni", "ika"]],
+			[3, ["ika", "ika", "uni"]],
+		]},
+}
+const COURSE_IDS := ["easy", "normal", "hard"]
 
 enum { FLOOR, ROCK, WEED }
 
-## sight: 視界の奥行き（0 は見ない） speed: 巡回の速さ  aspeed: 追うときの速さ
-## move: "patrol" 往復 / "sentry" その場で向きを変える / "fixed" 動かない / "drift" ふらふら
+## sight: 視界の奥行き（0 は見ない） speed: 巡回の速さ  aspeed: 追うときの速さ  coin: 倒したときのコイン
+## move: "patrol" 往復 / "sentry" その場で向きを変える / "fixed" 動かない / "drift" ふらふら / "spike" 動かないトゲ
+## ink: 攻撃が当たると、じゃまな「タコの墨」カードを捨て札に混ぜる
 const ENEMIES := {
-	"fugu": {"name": "フグ", "hp": 2, "atk": 1, "sight": 3, "speed": 1, "aspeed": 2, "move": "patrol"},
-	"kurage": {"name": "クラゲ", "hp": 1, "atk": 1, "sight": 0, "speed": 1, "aspeed": 1, "move": "drift"},
-	"ankou": {"name": "アンコウ", "hp": 3, "atk": 2, "sight": 4, "speed": 0, "aspeed": 1, "move": "sentry"},
-	"kani": {"name": "オオガニ", "hp": 4, "atk": 2, "sight": 2, "speed": 1, "aspeed": 2, "move": "patrol"},
-	"utsubo": {"name": "ウツボ", "hp": 3, "atk": 2, "sight": 2, "speed": 0, "aspeed": 0, "move": "fixed"},
-	"same": {"name": "サメ", "hp": 6, "atk": 3, "sight": 4, "speed": 1, "aspeed": 3, "move": "patrol"},
-	"ryu": {"name": "海竜", "hp": 22, "atk": 4, "sight": 0, "speed": 1, "aspeed": 1, "move": "boss"},
+	"fugu": {"name": "フグ", "hp": 2, "atk": 1, "sight": 3, "speed": 1, "aspeed": 2, "move": "patrol", "coin": 4,
+		"note": "決まった道を行ったり来たり"},
+	"kurage": {"name": "クラゲ", "hp": 1, "atk": 1, "sight": 0, "speed": 1, "aspeed": 1, "move": "drift", "coin": 2,
+		"note": "目が見えない。ふらふら動いて、となりを刺す"},
+	"ankou": {"name": "アンコウ", "hp": 3, "atk": 2, "sight": 4, "speed": 0, "aspeed": 1, "move": "sentry", "coin": 6,
+		"note": "その場で2ターンごとに向きを変える"},
+	"kani": {"name": "オオガニ", "hp": 4, "atk": 2, "sight": 2, "speed": 1, "aspeed": 2, "move": "patrol", "coin": 7,
+		"note": "かたい。視界はせまい"},
+	"utsubo": {"name": "ウツボ", "hp": 3, "atk": 2, "sight": 2, "speed": 0, "aspeed": 0, "move": "fixed", "coin": 6,
+		"note": "動かない。前とまわりにかみつく"},
+	"same": {"name": "サメ", "hp": 6, "atk": 3, "sight": 4, "speed": 1, "aspeed": 3, "move": "patrol", "coin": 12,
+		"note": "強くて速い。見つかったら逃げよう"},
+	"ika": {"name": "イカ", "hp": 2, "atk": 1, "sight": 3, "speed": 2, "aspeed": 3, "move": "patrol", "coin": 5,
+		"note": "巡回が2マスずつと速い"},
+	"tako": {"name": "タコ", "hp": 3, "atk": 1, "sight": 3, "speed": 0, "aspeed": 1, "move": "sentry", "coin": 7, "ink": true,
+		"note": "墨をかけられると、じゃまなカードがデッキに混ざる"},
+	"ei": {"name": "エイ", "hp": 4, "atk": 2, "sight": 4, "speed": 2, "aspeed": 2, "move": "patrol", "coin": 9,
+		"note": "大きく速い見張り。視界が広い"},
+	"uni": {"name": "ウニ", "hp": 3, "atk": 1, "sight": 0, "speed": 0, "aspeed": 0, "move": "spike", "coin": 5,
+		"note": "動かない。となりでターンを終えるとトゲが刺さる。かみつく・尾びれで殴ると自分も1ダメージ"},
+	"ryu": {"name": "海竜", "hp": 24, "atk": 4, "sight": 0, "speed": 1, "aspeed": 1, "move": "boss", "coin": 0,
+		"note": "赤く光るマスに次のターン攻撃。泡のブレスか音波で気絶させると止まる（すぐには効かない）。押し出せない"},
 }
 
 ## 海竜の技：予告したマスに次の敵のターンで当たる。泡のブレスや音波で気絶させると取り消せる
 const BOSS_ATTACKS := {
-	"tail": {"name": "尾の一撃", "dmg": 3},
+	"tail": {"name": "尾の大なぎ", "dmg": 3},
 	"breath": {"name": "竜のブレス", "dmg": 4},
-	"whirl": {"name": "大渦", "dmg": 2},
+	"whirl": {"name": "大渦", "dmg": 3},
+	"rain": {"name": "星くずの雨", "dmg": 3},
 }
-
-## 階ごとの敵
-const STAGE_ENEMIES := [
-	["fugu", "fugu", "ankou", "kurage"],
-	["fugu", "fugu", "kani", "utsubo", "ankou", "kurage"],
-	["same", "kani", "fugu", "fugu", "ankou", "utsubo", "kurage"],
-	["fugu", "fugu"],
-]
 
 var rng := RandomNumberGenerator.new()
 
 # ラン全体
+var course_id := "easy"
+var course: Dictionary = COURSES["easy"]
 var stage := 1
 var hp := MAX_HP
 var max_hp := MAX_HP
 var air := MAX_AIR
+var max_air := MAX_AIR
+var coins := 0
+var coins_total := 0
+var relics: Array[String] = []
 var deck: Array[String] = []
 var hand: Array[String] = []
 var discard: Array[String] = []
@@ -79,18 +128,63 @@ var plays_left := PLAYS
 var hidden := false
 var shield := 0
 var spotted := 0     # この階で見つかった回数
+var coin_items := {}  # Vector2i -> コインの山の額
 var cleared := false
 var exited := false
 var _next_id := 1
 
 
-func _init(seed_value: int = -1) -> void:
+func _init(seed_value: int = -1, cid: String = "easy") -> void:
 	if seed_value >= 0:
 		rng.seed = seed_value
 	else:
 		rng.randomize()
+	course_id = cid
+	course = COURSES[cid]
+	max_hp = int(course.hp)
+	hp = max_hp
+	max_air = int(course.air)
+	air = max_air
 	for c in Cards.START_DECK:
 		owned.append(c)
+
+
+func stages() -> int:
+	return course.floors.size()
+
+
+## 見た目の層（0 浅瀬 / 1 遺跡 / 2 深海 / 3 最深部）
+func zone() -> int:
+	return int(course.floors[mini(stage, stages()) - 1][0])
+
+
+func has_relic(id: String) -> bool:
+	return id in relics
+
+
+func add_relic(id: String) -> void:
+	if id in relics:
+		return
+	relics.append(id)
+	match id:
+		"coral":
+			max_hp += 4
+			hp += 4
+		"float":
+			max_air += 10
+			air += 10
+
+
+func hand_size() -> int:
+	return HAND + (1 if has_relic("bag") else 0)
+
+
+func _gain_coins(n: int, at: Vector2i, ev: Array) -> void:
+	if has_relic("scale"):
+		n = ceili(n * 1.5)
+	coins += n
+	coins_total += n
+	ev.append({"t": "coin", "n": n, "at": at})
 
 
 # ───────── 階づくり ─────────
@@ -101,7 +195,8 @@ func start_stage() -> Array:
 	exited = false
 	hidden = false
 	shield = 0
-	air = MAX_AIR
+	air = max_air
+	coin_items.clear()
 	if is_boss_stage():
 		_build_boss_map()
 	else:
@@ -117,7 +212,7 @@ func start_stage() -> Array:
 
 
 func is_boss_stage() -> bool:
-	return stage >= STAGES
+	return stage >= stages()
 
 
 func boss():
@@ -149,15 +244,14 @@ func _build_boss_map() -> void:
 		items[Vector2i(8, 2)] = "vent"
 		items[Vector2i(0, 1)] = "pearl"
 		items[Vector2i(8, 10)] = "vent"
-		var d: Dictionary = ENEMIES["ryu"]
 		var bp := Vector2i(W / 2, H - 3)
-		units.append({"id": _next_id, "kind": "ryu", "pos": bp, "dir": Vector2i(0, -1), "hp": int(d.hp), "max_hp": int(d.hp),
-			"atk": int(d.atk), "sight": 0, "speed": 1, "aspeed": 1, "move": "boss", "state": "sleep", "route": [bp], "ri": 0,
-			"rstep": 1, "last_seen": Vector2i(-1, -1), "lost": 0, "stun": 0, "invest": Vector2i(-1, -1), "wait": 0,
-			"home": bp, "home_dir": Vector2i(0, -1), "pending": [], "pkind": "", "acount": 0, "sleep_turns": 0})
-		_next_id += 1
+		var b := _make_enemy("ryu", bp, Vector2i(0, -1), [bp])
+		b.hp = int(course.boss_hp)
+		b.max_hp = b.hp
+		b.state = "sleep"
+		b.merge({"pending": [], "pkind": "", "pdmg": 0, "acount": 0, "sleep_turns": 0, "guard": 0, "phase2": false})
 		var ok := true
-		for kind in STAGE_ENEMIES[STAGES - 1]:
+		for kind in _floor_enemies():
 			if not _place_enemy(kind, start):
 				ok = false
 		if ok:
@@ -237,19 +331,34 @@ func _try_build() -> bool:
 			break
 		if _near_item(p, 3):
 			continue
-		items[p] = "chest"
+		# 2階からは、ときどき金の宝箱（お守りが入っている）
+		items[p] = "gchest" if placed == 1 and stage >= 2 and rng.randf() < 0.3 else "chest"
 		placed += 1
 	_shuffle(free)
-	for it in ["pearl", "vent"]:
+	for it in ["pearl", "vent", "coin", "coin"]:
 		for p in free:
 			if not items.has(p) and not _near_item(p, 2) and p.y >= 3:
 				items[p] = it
+				if it == "coin":
+					coin_items[p] = rng.randi_range(6, 10) + stage
 				break
-	# 敵
-	for kind in STAGE_ENEMIES[mini(stage, STAGES) - 1]:
+	# 敵。2階から（コースによる）1体が「ぬし」になる：強いけど、倒すとお守りが手に入る
+	for kind in _floor_enemies():
 		if not _place_enemy(kind, start):
 			return false
+	if stage >= int(course.elite_from):
+		var cands := enemies().filter(func(u): return not u.kind in ["kurage", "uni"])
+		if not cands.is_empty():
+			var e: Dictionary = cands[rng.randi() % cands.size()]
+			e.elite = true
+			e.hp = e.hp * 2 + 1
+			e.max_hp = e.hp
+			e.atk += 1
 	return true
+
+
+func _floor_enemies() -> Array:
+	return course.floors[mini(stage, stages()) - 1][1]
 
 
 func _far_score(p: Vector2i, start: Vector2i, exit: Vector2i) -> int:
@@ -285,7 +394,7 @@ func _place_enemy(kind: String, start: Vector2i) -> bool:
 				route.append(q)
 			if route.size() < 3:
 				continue
-		elif d.move == "fixed":
+		elif d.move == "fixed" or d.move == "spike":
 			# ウツボは壁を背にして、ひらけた方を向く
 			var open := []
 			for dd in DIRS:
@@ -298,13 +407,23 @@ func _place_enemy(kind: String, start: Vector2i) -> bool:
 			dir = DIRS[rng.randi() % 4]
 		if kind != "kurage" and _sees_from(p, dir, int(d.sight), start, false):
 			continue
-		units.append({"id": _next_id, "kind": kind, "pos": p, "dir": dir, "hp": int(d.hp), "max_hp": int(d.hp),
-			"atk": int(d.atk), "sight": int(d.sight), "speed": int(d.speed), "aspeed": int(d.aspeed), "move": d.move,
-			"state": "patrol", "route": route, "ri": 0, "rstep": 1, "last_seen": Vector2i(-1, -1), "lost": 0,
-			"stun": 0, "invest": Vector2i(-1, -1), "wait": 0, "home": p, "home_dir": dir})
-		_next_id += 1
+		_make_enemy(kind, p, dir, route)
 		return true
 	return false
+
+
+func _make_enemy(kind: String, p: Vector2i, dir: Vector2i, route: Array) -> Dictionary:
+	var d: Dictionary = ENEMIES[kind]
+	var boss_like: bool = d.move == "boss"
+	var hpv: int = int(d.hp) + (0 if boss_like else int(course.hp_plus))
+	var u := {"id": _next_id, "kind": kind, "pos": p, "dir": dir, "hp": hpv, "max_hp": hpv,
+		"atk": int(d.atk) + (0 if boss_like else int(course.atk)), "sight": int(d.sight), "speed": int(d.speed),
+		"aspeed": int(d.aspeed), "move": d.move, "state": "patrol", "route": route, "ri": 0, "rstep": 1,
+		"last_seen": Vector2i(-1, -1), "lost": 0, "stun": 0, "invest": Vector2i(-1, -1), "wait": 0, "home": p,
+		"home_dir": dir, "elite": false}
+	_next_id += 1
+	units.append(u)
+	return u
 
 
 # ───────── 盤の問い合わせ ─────────
@@ -436,7 +555,15 @@ func move_targets(range_n: int) -> Dictionary:
 
 ## 敵 u の視界のマス（扇形。奥ほど広い。壁でさえぎられる）
 func vision(u: Dictionary) -> Array:
-	return _cone(u.pos, u.dir, int(u.sight))
+	return _cone(u.pos, u.dir, _sight(u))
+
+
+## 深海ちょうちんを持っていると、敵の視界が1マス短い
+func _sight(u: Dictionary) -> int:
+	var sv := int(u.sight)
+	if sv > 0 and has_relic("lantern"):
+		sv = maxi(sv - 1, 1)
+	return sv
 
 
 func _cone(pos: Vector2i, dir: Vector2i, sight: int) -> Array:
@@ -468,7 +595,7 @@ func _clear_line(a: Vector2i, b: Vector2i) -> bool:
 func sees(u: Dictionary, p: Vector2i) -> bool:
 	if u.stun > 0:
 		return false
-	return _sees_from(u.pos, u.dir, int(u.sight), p, hidden)
+	return _sees_from(u.pos, u.dir, _sight(u), p, hidden)
 
 
 func _sees_from(pos: Vector2i, dir: Vector2i, sight: int, p: Vector2i, is_hidden: bool) -> bool:
@@ -509,6 +636,10 @@ func targets(i: int) -> Dictionary:
 		"move":
 			for p in move_targets(int(d.range)):
 				out[p] = true
+		"jump":
+			for p in all_cells():
+				if p != pos and walkable_tile(p) and unit_at(p) == null and _dist(p, pos) <= int(d.range):
+					out[p] = true
 		"adj":
 			for dd in DIRS:
 				var u = unit_at(pos + dd)
@@ -522,8 +653,11 @@ func targets(i: int) -> Dictionary:
 						break
 					out[p] = true
 		"spot":
+			var weed_only: bool = Cards.base(hand[i]) == "curtain"
 			for p in all_cells():
 				if walkable_tile(p) and _dist(p, pos) <= int(d.range) and p != pos:
+					if weed_only and (tile(p) != FLOOR or items.has(p)):
+						continue
 					out[p] = true
 	return out
 
@@ -531,9 +665,13 @@ func targets(i: int) -> Dictionary:
 ## 泳ぐとして使うときに選べるマス
 func swim_targets(i: int) -> Dictionary:
 	var out := {}
-	for p in move_targets(int(Cards.def(hand[i]).mv)):
+	for p in move_targets(swim_range(i)):
 		out[p] = true
 	return out
+
+
+func swim_range(i: int) -> int:
+	return int(Cards.def(hand[i]).mv) + (1 if has_relic("board") else 0)
 
 
 ## カードを使う。as_move なら「泳ぐ」として使う。at は選んだマス（self なら無視）
@@ -543,6 +681,7 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 		return ev
 	var id: String = hand[i]
 	var d := Cards.def(id)
+	var bid := Cards.base(id)
 	hand.remove_at(i)
 	if d.get("exhaust", false) and not as_move:
 		exhausted.append(id)
@@ -553,19 +692,85 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 	_spend_air(int(d.cost), ev)
 	var pos: Vector2i = me().pos
 	if as_move:
-		_move_me(at, int(d.mv), ev)
+		_move_me(at, int(d.mv) + (1 if has_relic("board") else 0), ev)
 	else:
-		match id:
+		match bid:
 			"swim", "swim2", "dash":
 				_move_me(at, int(d.range), ev)
 				if d.has("noise") and not exited:
 					_noise(me().pos, int(d.noise), ev)
-			"tail":
+			"tail", "bite":
 				var u = unit_at(at)
 				if u != null and u.id != 0:
 					_face_me(at - pos, ev)
 					ev.append({"t": "attack", "id": 0, "to": at})
-					_hit(u, int(d.dmg), at - pos, ev)
+					var spiky: bool = u.move == "spike"
+					_hit(u, int(d.dmg), at - pos if d.get("push", false) else Vector2i.ZERO, ev)
+					if spiky:
+						# ウニを殴るとトゲが刺さる
+						_hurt_me(1, u, ev)
+			"current":
+				var dir := _dir_to(pos, at)
+				var path := []
+				var p := pos
+				for k in int(d.range):
+					var n: Vector2i = p + dir
+					if not walkable_tile(n) or unit_at(n) != null:
+						break
+					p = n
+					path.append(p)
+					if items.has(p):
+						break
+				if not path.is_empty():
+					me().dir = dir
+					me().pos = p
+					ev.append({"t": "move", "id": 0, "path": path, "fast": true})
+					_arrive(ev)
+			"leap":
+				if walkable_tile(at) and unit_at(at) == null:
+					_face_me(_dir_to(pos, at), ev)
+					me().pos = at
+					ev.append({"t": "move", "id": 0, "path": [at], "fast": true, "jump": true})
+					_arrive(ev)
+			"horn":
+				var dir := _dir_to(pos, at)
+				_face_me(dir, ev)
+				ev.append({"t": "beam", "from": pos, "dir": dir, "kind": "horn", "n": int(d.range)})
+				var hits := []
+				for k in range(1, int(d.range) + 1):
+					var p: Vector2i = pos + dir * k
+					if not walkable_tile(p):
+						break
+					var u = unit_at(p)
+					if u != null:
+						hits.append(u)
+				# 奥から順に（手前の敵が奥の敵にぶつからないように）
+				hits.reverse()
+				for u in hits:
+					if units.has(u):
+						_hit(u, int(d.dmg), dir, ev)
+			"tide":
+				var dir := _dir_to(pos, at)
+				_face_me(dir, ev)
+				ev.append({"t": "beam", "from": pos, "dir": dir, "kind": "tide", "n": int(d.range)})
+				for k in range(1, int(d.range) + 1):
+					var p: Vector2i = pos + dir * k
+					if not walkable_tile(p):
+						break
+					var u = unit_at(p)
+					if u != null:
+						_hit(u, int(d.dmg), Vector2i.ZERO, ev)
+						if units.has(u) and u.move != "boss":
+							# となりまで引きよせる
+							var to: Vector2i = u.pos
+							while to - dir != pos and walkable_tile(to - dir) and unit_at(to - dir) == null:
+								to -= dir
+							if to != u.pos:
+								u.pos = to
+								ev.append({"t": "push", "id": u.id, "to": to})
+						if units.has(u) and d.has("stun"):
+							_stun(u, int(d.stun), ev)
+						break
 			"charge":
 				var dir := _dir_to(pos, at)
 				_face_me(dir, ev)
@@ -602,7 +807,7 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 					var u = unit_at(p)
 					if u != null:
 						_hit(u, int(d.dmg), Vector2i.ZERO, ev)
-						if d.has("stun") and u.hp > 0:
+						if d.has("stun") and u.hp > 0 and units.has(u):
 							_stun(u, int(d.stun), ev)
 						if not d.get("pierce", false):
 							break
@@ -623,8 +828,19 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 				hidden = true
 				ev.append({"t": "hide"})
 			"shield":
-				shield = int(d.block)
+				shield += int(d.block)
 				ev.append({"t": "shield"})
+			"curtain":
+				if tile(at) == FLOOR:
+					_put(at, WEED)
+					ev.append({"t": "weed", "at": at})
+			"map":
+				_gain_coins(int(d.coins), pos, ev)
+			"cheer":
+				plays_left += int(d.plays)
+				ev.append({"t": "cheer", "n": int(d.plays)})
+			"ink":
+				ev.append({"t": "ink_clear"})
 			"breath":
 				air += int(d.air)
 				ev.append({"t": "air", "n": int(d.air)})
@@ -642,7 +858,28 @@ func play(i: int, as_move: bool, at: Vector2i) -> Array:
 	return ev
 
 
+## 敵を倒したら、コインと（ぬしなら）お守り
+func _on_kill(u: Dictionary, ev: Array) -> void:
+	var c: int = int(ENEMIES[u.kind].coin)
+	if u.get("elite", false):
+		c *= 2
+	if c > 0:
+		_gain_coins(c, u.pos, ev)
+	if has_relic("gill"):
+		air += 3
+		ev.append({"t": "air", "n": 3})
+	if u.get("elite", false):
+		var r := relic_choices(1)
+		if not r.is_empty():
+			add_relic(r[0])
+			ev.append({"t": "relic", "id": r[0], "at": u.pos})
+
+
 func _stun(u: Dictionary, n: int, ev: Array) -> void:
+	# 海竜は一度気絶すると、しばらく気絶しない
+	if u.move == "boss" and u.guard > 0:
+		ev.append({"t": "resist", "id": u.id})
+		return
 	u.stun = n
 	ev.append({"t": "stun", "id": u.id})
 	# 海竜の予告攻撃は、気絶させると取り消せる
@@ -684,12 +921,25 @@ func _arrive(ev: Array) -> void:
 	match it:
 		"exit":
 			exited = true
+			if spotted == 0:
+				_gain_coins(15, p, ev)
 			ev.append({"t": "exit"})
-			if stage >= STAGES:
-				cleared = true
 		"chest":
 			items.erase(p)
+			_gain_coins(8 + stage * 2, p, ev)
 			ev.append({"t": "chest", "at": p})
+		"gchest":
+			items.erase(p)
+			var r := relic_choices(1)
+			if r.is_empty():
+				ev.append({"t": "chest", "at": p})
+			else:
+				add_relic(r[0])
+				ev.append({"t": "relic", "id": r[0], "at": p, "chest": true})
+		"coin":
+			items.erase(p)
+			ev.append({"t": "pickup", "item": "coin", "at": p})
+			_gain_coins(coin_items.get(p, 8), p, ev)
 		"pearl":
 			items.erase(p)
 			var n: int = mini(3, max_hp - hp)
@@ -717,7 +967,7 @@ func _spend_air(n: int, ev: Array) -> void:
 func _hit(u: Dictionary, dmg: int, push: Vector2i, ev: Array) -> void:
 	var sneak: bool = u.state != "alert" and u.stun == 0
 	if sneak:
-		dmg *= 2
+		dmg *= 3 if has_relic("fang") else 2
 	var wall := false
 	if push != Vector2i.ZERO and u.hp > dmg and u.move != "boss":
 		var dir := Vector2i(signi(push.x), signi(push.y))
@@ -728,13 +978,14 @@ func _hit(u: Dictionary, dmg: int, push: Vector2i, ev: Array) -> void:
 		else:
 			# 壁や仲間にぶつかると、もう1ダメージ
 			wall = true
-			dmg += 1
+			dmg += 3 if has_relic("spiral") else 1
 	u.hp -= dmg
 	ev.append({"t": "hit", "id": u.id, "dmg": dmg, "sneak": sneak, "wall": wall})
 	if u.hp <= 0:
 		units.erase(u)
 		kills += 1
 		ev.append({"t": "die", "id": u.id})
+		_on_kill(u, ev)
 		if u.move == "boss":
 			# 海竜を倒すと星のかけらが手に入る
 			cleared = true
@@ -753,7 +1004,12 @@ func _hurt_me(dmg: int, from, ev: Array, from_air: bool = false) -> void:
 		dmg -= blocked
 	hp = maxi(hp - dmg, 0)
 	ev.append({"t": "phit", "id": from.id if from != null else -1, "dmg": dmg, "blocked": blocked, "air": from_air})
-	if hp <= 0:
+	if hp <= 0 and has_relic("ribbon"):
+		# ミラのリボン：1回だけ起き上がる
+		relics.erase("ribbon")
+		hp = 5
+		ev.append({"t": "revive"})
+	elif hp <= 0:
 		ev.append({"t": "faint"})
 
 
@@ -781,7 +1037,7 @@ func _alert(u: Dictionary, ev: Array, spread: bool) -> void:
 	if not spread:
 		return
 	for o in enemies():
-		if o.state != "alert" and o.move != "fixed" and o.sight > 0 and _dist(o.pos, u.pos) <= ALERT_RADIUS:
+		if o.state != "alert" and o.move != "fixed" and o.sight > 0 and _dist(o.pos, u.pos) <= int(course.alert):
 			o.state = "alert"
 			o.last_seen = me().pos
 			o.lost = 0
@@ -808,7 +1064,7 @@ func _check_spotted(ev: Array) -> void:
 func _draw(n: int, ev: Array) -> void:
 	var got := 0
 	for k in n:
-		if hand.size() >= HAND + 2:
+		if hand.size() >= hand_size() + 2:
 			break
 		if deck.is_empty():
 			if discard.is_empty():
@@ -827,8 +1083,8 @@ func _begin_turn(ev: Array) -> void:
 	turn += 1
 	plays_left = PLAYS
 	hidden = false
-	shield = 0
-	_draw(maxi(HAND - hand.size(), 0), ev)
+	shield = 1 if has_relic("shell") else 0
+	_draw(maxi(hand_size() - hand.size(), 0), ev)
 
 
 ## ターン終了 → 敵のターン → 次のターン
@@ -857,12 +1113,18 @@ func end_turn() -> Array:
 
 
 func _enemy_act(u: Dictionary, ev: Array) -> void:
+	if u.move == "boss":
+		_boss_act(u, ev)
+		return
 	if u.stun > 0:
 		u.stun -= 1
 		return
 	var pos: Vector2i = me().pos
-	if u.move == "boss":
-		_boss_act(u, ev)
+	if u.move == "spike":
+		# ウニ：となりにいたらトゲが刺さる
+		if _dist(u.pos, pos) == 1:
+			ev.append({"t": "attack", "id": u.id, "to": pos})
+			_hurt_me(u.atk, u, ev)
 		return
 	if u.move == "drift":
 		# クラゲ：ふらふら動いて、となりにいたら刺す
@@ -935,64 +1197,130 @@ func _wake(u: Dictionary, ev: Array) -> void:
 
 
 ## 海竜：眠っている間はじっとしている（近づくか攻撃すると起きる。6ターンで自然に起きる）。
-## 起きたら「予告 → 次のターンに攻撃」をくり返す。予告していないときは1マス近づく
+## 起きたら毎ターン「予告していた攻撃 → 近づく → 次の攻撃を予告」。体力が半分を切ると怒って子分を呼び、
+## 攻撃が2つ重なるようになる。気絶させると予告が消えるが、そのあと2ターンは気絶しない
 func _boss_act(u: Dictionary, ev: Array) -> void:
-	var pos: Vector2i = me().pos
 	if u.state != "alert":
 		u.sleep_turns += 1
 		if u.sleep_turns >= 6:
 			_wake(u, ev)
 		return
+	if u.stun > 0:
+		u.stun = 0
+		u.guard = 2
+		_boss_plan(u, ev)
+		return
+	if u.guard > 0:
+		u.guard -= 1
+	var pos: Vector2i = me().pos
 	if not u.pending.is_empty():
-		var a: Dictionary = BOSS_ATTACKS[u.pkind]
 		ev.append({"t": "boss_atk", "id": u.id, "kind": u.pkind, "tiles": u.pending})
+		var dmg: int = int(u.pdmg)
 		var hit_me: bool = pos in u.pending
 		# 子分も巻きこまれる
 		for o in enemies():
 			if o.id != u.id and o.pos in u.pending and units.has(o):
-				_hit(o, int(a.dmg), Vector2i.ZERO, ev)
+				_hit(o, dmg, Vector2i.ZERO, ev)
 		if hit_me:
-			_hurt_me(int(a.dmg), u, ev)
+			_hurt_me(dmg, u, ev)
 		u.pending = []
 		ev.append({"t": "warn", "id": u.id, "tiles": [], "kind": ""})
-		return
+		if hp <= 0:
+			return
+	if not u.phase2 and u.hp * 2 <= u.max_hp:
+		u.phase2 = true
+		ev.append({"t": "boss_phase", "id": u.id})
+		for kind in course.summon:
+			_summon(kind, u.pos, ev)
+	_boss_plan(u, ev)
+
+
+func _boss_plan(u: Dictionary, ev: Array) -> void:
+	var pos: Vector2i = me().pos
 	var cheb: int = maxi(abs(pos.x - u.pos.x), abs(pos.y - u.pos.y))
-	var kind := ""
-	var tiles := []
+	if cheb > 2:
+		_step_toward(u, pos, 2 if u.phase2 else 1, ev)
+		cheb = maxi(abs(pos.x - u.pos.x), abs(pos.y - u.pos.y))
 	u.acount += 1
+	var kinds := []
 	if cheb <= 1:
-		kind = "tail"
-		for dx in [-1, 0, 1]:
-			for dy in [-1, 0, 1]:
-				var p: Vector2i = u.pos + Vector2i(dx, dy)
-				if p != u.pos and walkable_tile(p):
-					tiles.append(p)
-	elif u.acount % 3 == 0:
-		kind = "whirl"
-		# カノープスのまわりに渦。真ん中と、ななめ4マス
-		for d in [Vector2i.ZERO, Vector2i(1, 1), Vector2i(-1, 1), Vector2i(1, -1), Vector2i(-1, -1)]:
-			var p: Vector2i = pos + d
-			if walkable_tile(p):
-				tiles.append(p)
+		kinds.append("tail")
 	else:
-		kind = "breath"
-		if _dist(u.pos, pos) > 4:
-			_step_toward(u, pos, 1, ev)
-		var dir := _dir_to(u.pos, pos)
-		u.dir = dir
-		ev.append({"t": "face", "id": u.id, "dir": dir})
-		var side := Vector2i(-dir.y, dir.x)
-		for k in range(1, 8):
-			var c: Vector2i = u.pos + dir * k
-			if not walkable_tile(c):
-				break
-			for sdx in [-1, 0, 1]:
-				var p: Vector2i = c + side * sdx
-				if walkable_tile(p) and (k > 1 or sdx == 0 or true):
-					tiles.append(p)
-	u.pending = tiles
-	u.pkind = kind
-	ev.append({"t": "warn", "id": u.id, "tiles": tiles, "kind": kind})
+		kinds.append(["breath", "whirl", "breath", "rain"][u.acount % 4])
+	if u.phase2 and course.get("double", true):
+		kinds.append("rain" if kinds[0] == "whirl" else "whirl")
+	var set := {}
+	var dmg := 0
+	for k in kinds:
+		for p in _boss_shape(u, k, ev):
+			set[p] = true
+		dmg = maxi(dmg, int(BOSS_ATTACKS[k].dmg))
+	var names := []
+	for k in kinds:
+		names.append(BOSS_ATTACKS[k].name)
+	u.pending = set.keys()
+	u.pkind = kinds[0]
+	u.pdmg = dmg + int(course.boss_dmg)
+	ev.append({"t": "warn", "id": u.id, "tiles": u.pending, "kind": kinds[0], "name": "＋".join(names)})
+
+
+func _boss_shape(u: Dictionary, kind: String, ev: Array) -> Array:
+	var pos: Vector2i = me().pos
+	var tiles := []
+	match kind:
+		"tail":
+			# まわり2マス（5×5）をなぎ払う
+			for dx in range(-2, 3):
+				for dy in range(-2, 3):
+					var p: Vector2i = u.pos + Vector2i(dx, dy)
+					if p != u.pos and walkable_tile(p):
+						tiles.append(p)
+		"whirl":
+			# カノープスのまわり3×3
+			for dx in [-1, 0, 1]:
+				for dy in [-1, 0, 1]:
+					var p: Vector2i = pos + Vector2i(dx, dy)
+					if walkable_tile(p):
+						tiles.append(p)
+		"rain":
+			# カノープスのいるマスと、そのまわりに降る星くず
+			tiles.append(pos)
+			var cand := []
+			for p in all_cells():
+				if walkable_tile(p) and p != pos and _dist(p, pos) <= 4:
+					cand.append(p)
+			_shuffle(cand)
+			tiles.append_array(cand.slice(0, 10))
+		"breath":
+			var dir := _dir_to(u.pos, pos)
+			u.dir = dir
+			ev.append({"t": "face", "id": u.id, "dir": dir})
+			var side := Vector2i(-dir.y, dir.x)
+			for k in range(1, 13):
+				# 柱（岩）の陰には届かない
+				var c: Vector2i = u.pos + dir * k
+				if not walkable_tile(c):
+					break
+				for sdx in [-1, 0, 1]:
+					var p: Vector2i = c + side * sdx
+					if walkable_tile(p):
+						tiles.append(p)
+	return tiles
+
+
+## 海竜が呼ぶ子分（はじめから追ってくる）
+func _summon(kind: String, near: Vector2i, ev: Array) -> void:
+	var cand := []
+	for p in all_cells():
+		if walkable_tile(p) and unit_at(p) == null and not items.has(p) and _dist(p, near) <= 3 and _dist(p, me().pos) >= 2:
+			cand.append(p)
+	if cand.is_empty():
+		return
+	var p: Vector2i = cand[rng.randi() % cand.size()]
+	var u := _make_enemy(kind, p, _dir_to(p, me().pos), [p])
+	u.state = "alert"
+	u.last_seen = me().pos
+	ev.append({"t": "summon", "id": u.id})
 
 
 ## 次の敵のターンに攻撃が来るマス
@@ -1039,7 +1367,7 @@ func _chase(u: Dictionary, ev: Array) -> void:
 	var pos: Vector2i = me().pos
 	if not sees(u, pos) and _dist(u.pos, pos) > 1:
 		u.lost += 1
-		if u.lost > LOSE_TURNS:
+		if u.lost > int(course.lose):
 			u.state = "search"
 			u.wait = 0
 			ev.append({"t": "lost", "id": u.id})
@@ -1054,6 +1382,10 @@ func _chase(u: Dictionary, ev: Array) -> void:
 		ev.append({"t": "face", "id": u.id, "dir": u.dir})
 		ev.append({"t": "attack", "id": u.id, "to": pos})
 		_hurt_me(u.atk, u, ev)
+		if ENEMIES[u.kind].get("ink", false) and hp > 0:
+			# タコの墨：じゃまなカードが捨て札に混ざる
+			discard.append("ink")
+			ev.append({"t": "ink", "id": u.id})
 
 
 func _step_toward(u: Dictionary, goal: Vector2i, steps: int, ev: Array) -> void:
@@ -1083,12 +1415,59 @@ func next_step(u: Dictionary) -> Vector2i:
 	return u.route[ni]
 
 
-# ───────── 階の終わり ─────────
+# ───────── 階の終わり・お店 ─────────
 
-func reward_choices(n: int = 3) -> Array:
-	var pool := Cards.REWARDS.duplicate()
+## カードの候補。めずらしいカードほど出にくい
+func reward_choices(n: int = 3, up: bool = false) -> Array:
+	var out := []
+	for guard in 50:
+		if out.size() >= n:
+			break
+		var pool := []
+		for id in Cards.REWARDS:
+			for k in 3 - int(Cards.DEFS[id].rare):
+				pool.append(id)
+		var id: String = pool[rng.randi() % pool.size()]
+		if id in out:
+			continue
+		out.append(id)
+	if up:
+		out = out.map(func(id): return Cards.upgraded(id))
+	return out
+
+
+## 宝箱から出るカード（星のかぎを持っていれば強化済み）
+func chest_choices() -> Array:
+	return reward_choices(3, has_relic("key"))
+
+
+func relic_choices(n: int) -> Array:
+	var pool := []
+	for id in Relics.DEFS:
+		if not id in relics:
+			pool.append(id)
 	_shuffle(pool)
 	return pool.slice(0, n)
+
+
+const UPGRADE_COST := 40
+const REMOVE_COST := 30
+const HEAL_COST := 20
+const HEAL_AMOUNT := 5
+
+
+func spend(n: int) -> bool:
+	if coins < n:
+		return false
+	coins -= n
+	return true
+
+
+## お店の品ぞろえ：カード4枚（1枚は強化済み）とお守り2つ
+func shop_stock() -> Dictionary:
+	var cards := reward_choices(4)
+	cards[3] = Cards.upgraded(cards[3])
+	return {"cards": cards, "relics": relic_choices(2)}
 
 
 func add_card(id: String) -> void:
@@ -1098,6 +1477,12 @@ func add_card(id: String) -> void:
 
 func remove_card(id: String) -> void:
 	owned.erase(id)
+
+
+func upgrade_card(id: String) -> void:
+	var i := owned.find(id)
+	if i >= 0 and Cards.can_upgrade(id):
+		owned[i] = Cards.upgraded(id)
 
 
 ## 空気だまりで休んで次の階へ

@@ -163,6 +163,17 @@ def main():
     for i, nm in enumerate(["E6", "B6", "E7", "G#7", "B7"]):
         at(sr, celesta(freq(nm), 1.2, 0.9), i * 0.09)
     save("star", sr)
+    # お店：買った（コインがじゃらっ）／強化（きらりと上がる）
+    by = silence(0.7)
+    for i in range(5):
+        at(by, celesta(freq(["B6", "E7", "G#6", "B6", "E7"][i]), 0.4, 0.6), i * 0.045 + rng.uniform(0, 0.015))
+    at(by, kalimba(freq("E6"), 0.5) * 0.7, 0.22)
+    save("buy", by)
+    up = silence(1.0)
+    at(up, sweep(600, 1800, 0.35, 1.5) * 0.25, 0)
+    for i, nm in enumerate(["E6", "G#6", "B6", "E7"]):
+        at(up, kalimba(freq(nm), 0.5) * 0.8, 0.1 + i * 0.07)
+    save("upgrade", up)
 
 
 if __name__ == "__main__":

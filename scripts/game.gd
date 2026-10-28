@@ -1,10 +1,10 @@
 extends Control
 
-## 画面の流れ：TITLE →（はじめてなら おはなし）→ PLAY（階）→ REST（空気だまり）→ PLAY … → RESULT
+## 画面の流れ：TITLE → コースえらび →（はじめてなら おはなし）→ PLAY（階）→ REST（空気だまり）→ SHOP（お店）→ PLAY … → RESULT
 ## ルールは Tactics（tactics.gd）、3D のマップは World（world.gd）。ここは画面づくりと演出。
 ## Tactics が返す events を _run_events で順に見せる。
 
-enum { TITLE, PLAY, REST, RESULT }
+enum { TITLE, PLAY, REST, SHOP, RESULT }
 
 const BGS := ["bg_shallow", "bg_mid", "bg_deep", "bg_deep"]
 const BGMS := ["shallow", "mid", "deep", "boss"]
@@ -19,6 +19,8 @@ var state := TITLE
 var run: Tactics
 var clears := 0        # クリアした回数（タイトルに出す）
 var best_floor := 0
+var records := {}      # コース -> {clears, best}
+var course_id := "easy"
 var _story_seen := false
 
 # 層（下から）：背景 → 水の演出 → 3D マップ → 画面 → 演出の文字 → 会話
@@ -48,6 +50,10 @@ var _said := {}
 var _result := {}
 var _rest_picks := 0
 var _rest_choices := []
+var _stock := {}        # お店の品ぞろえ {cards, relics, sold}
+var _shop_say := ""
+var _relic_bar: Control
+var _deck_btn: Button
 
 # 会話
 var _talk_lines := []
@@ -98,8 +104,7 @@ func _on_layout() -> void:
 		n.position = Vector2.ZERO
 		n.size = v
 	_ocean.resize(v)
-	if world:
-		world.size = v
+	_place_world()
 	if _busy:
 		# 演出中に組み直すと手札がずれるので、終わってから
 		return
@@ -110,6 +115,8 @@ func _on_layout() -> void:
 			_build_play()
 		REST:
 			_show_rest()
+		SHOP:
+			_show_shop()
 		RESULT:
 			_show_result()
 	if not _talk_lines.is_empty():
@@ -122,6 +129,11 @@ func _load_save() -> void:
 		clears = int(cf.get_value("run", "clears", 0))
 		best_floor = int(cf.get_value("run", "best_floor", 0))
 		_story_seen = bool(cf.get_value("run", "story", false))
+		records = cf.get_value("run", "records", {})
+		course_id = str(cf.get_value("run", "course", "easy"))
+		# 前の版の記録は、あさせコースのものとして引きつぐ
+		if records.is_empty() and (clears > 0 or best_floor > 0):
+			records["easy"] = {"clears": clears, "best": best_floor}
 
 
 func _save() -> void:
@@ -129,6 +141,8 @@ func _save() -> void:
 	cf.set_value("run", "clears", clears)
 	cf.set_value("run", "best_floor", best_floor)
 	cf.set_value("run", "story", _story_seen)
+	cf.set_value("run", "records", records)
+	cf.set_value("run", "course", course_id)
 	cf.save(SAVE_PATH)
 
 
@@ -156,6 +170,8 @@ func _clear_ui() -> void:
 	_mode_box = null
 	_end_btn = null
 	_speech = null
+	_relic_bar = null
+	_deck_btn = null
 
 
 func _drop_world() -> void:
@@ -279,7 +295,12 @@ func _show_title() -> void:
 			var wave := ch.create_tween().set_loops()
 			wave.tween_property(ch, "position:y", base_y - 10, 0.9).set_trans(Tween.TRANS_SINE).set_delay(i * 0.12)
 			wave.tween_property(ch, "position:y", base_y, 0.9).set_trans(Tween.TRANS_SINE))
-	_label(("クリア %d回" % clears) if clears > 0 else (("最高 %d階" % best_floor) if best_floor > 0 else ""), 26, Vector2(0, top + 160), _ui, Color(1, 1, 1, 0.9), v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	var marks := PackedStringArray()
+	for cid in Tactics.COURSE_IDS:
+		var rec: Dictionary = records.get(cid, {})
+		if int(rec.get("clears", 0)) > 0:
+			marks.append("%s★%d" % [Tactics.COURSES[cid].name.trim_suffix("コース"), int(rec.clears)])
+	_label("クリア　" + "　".join(marks) if not marks.is_empty() else "", 26, Vector2(0, top + 160), _ui, Color(1, 1, 1, 0.9), v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	# ボタン
 	var bw := 360.0
 	var by := v.y - (430 if portrait else 330)
@@ -307,12 +328,55 @@ func _toggle_mute() -> void:
 
 
 func _on_start() -> void:
-	if not _story_seen:
-		_story_seen = true
-		_save()
-		_talk(Scenario.STORY, _start_run)
-	else:
-		_start_run()
+	_show_courses()
+
+
+## コースえらび：あさせ（はじめて向け）／しんかい／ならく
+func _show_courses() -> void:
+	var v := _view()
+	var shade := ColorRect.new()
+	shade.color = Color(0, 0.02, 0.06, 0.93)
+	shade.size = v
+	shade.z_index = 150
+	shade.mouse_filter = Control.MOUSE_FILTER_STOP
+	_ui.add_child(shade)
+	var portrait := Screen.portrait
+	_label("コースをえらぶ", 46, Vector2(0, 60 if portrait else 30), shade, UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	var cols := [Color(0.15, 0.6, 0.75), Color(0.2, 0.35, 0.8), Color(0.55, 0.2, 0.55)]
+	var w: float = minf(v.x - 60, 620) if portrait else 360.0
+	var h := 230.0 if portrait else 380.0
+	for i in Tactics.COURSE_IDS.size():
+		var cid: String = Tactics.COURSE_IDS[i]
+		var c: Dictionary = Tactics.COURSES[cid]
+		var pos := Vector2(v.x / 2 - w / 2, 150 + i * (h + 24)) if portrait else Vector2(v.x / 2 - 1.5 * w - 30 + i * (w + 30), 110)
+		var b := _button("", func():
+			course_id = cid
+			_save()
+			shade.queue_free()
+			if not _story_seen:
+				_story_seen = true
+				_save()
+				_talk(Scenario.STORY, _start_run)
+			else:
+				_start_run(), 28, cols[i])
+		b.position = pos
+		b.size = Vector2(w, h)
+		shade.add_child(b)
+		var rec: Dictionary = records.get(cid, {})
+		var stars := "★ クリア %d回" % int(rec.clears) if int(rec.get("clears", 0)) > 0 else ("最高 %d階" % int(rec.best) if int(rec.get("best", 0)) > 0 else "まだ遊んでいない")
+		var lines := [[c.name, 36, UiStyle.GOLD], [c.sub, 22, Color.WHITE],
+			["%d階　体力%d　空気%d" % [c.floors.size(), c.hp, c.air], 22, UiStyle.AIR], [stars, 22, UiStyle.PINK]]
+		if i == 0:
+			lines.insert(2, ["（はじめてならここから）", 20, Color(0.8, 0.95, 1.0)])
+		var y := 18.0
+		for ln in lines:
+			var l := _label(ln[0], ln[1], Vector2(10, y), b, ln[2], w - 20, HORIZONTAL_ALIGNMENT_CENTER)
+			l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			y += ln[1] + (22 if portrait else 40)
+	var back := _button("もどる", shade.queue_free, 24, Color(0.35, 0.4, 0.5))
+	back.size = Vector2(220, 60)
+	back.position = Vector2(v.x / 2 - 110, v.y - 100)
+	shade.add_child(back)
 
 
 func _show_help() -> void:
@@ -516,7 +580,7 @@ func _end_talk() -> void:
 # ───────── ラン ─────────
 
 func _start_run() -> void:
-	run = Tactics.new()
+	run = Tactics.new(-1, course_id)
 	_start_stage(run.start_stage())
 
 
@@ -524,23 +588,26 @@ func _start_stage(ev: Array) -> void:
 	state = PLAY
 	_said.clear()
 	_sel = -1
-	var z := run.stage - 1
+	var z := run.zone()
 	_bg.texture = null
 	_bg_shade.color = Color(0, 0, 0, 0)
 	_ocean.setup(_view(), 0.0)
 	Audio.bgm(BGMS[z])
 	_drop_world()
 	world = World.new()
-	world.size = _view()
 	_world_layer.add_child(world)
+	_place_world()
 	world.setup(run, z)
 	world.cell_tapped.connect(_on_cell)
 	_build_play()
 	if run.is_boss_stage():
 		await _boss_intro()
 	_floor_banner()
-	var pair: Array = Scenario.pick(Scenario.FLOOR_START[z])
-	_say_line(pair[0], "きゅ", pair[1], 1.4)
+	if run.stage == int(run.course.elite_from) and not run.is_boss_stage():
+		_say_line("金色の「ぬし」は強いけど、倒すとお守りが手に入るって！", "きゅ？", "point", 1.4)
+	else:
+		var pair: Array = Scenario.pick(Scenario.FLOOR_START[z])
+		_say_line(pair[0], "きゅ", pair[1], 1.4)
 	_set_hint("")
 	if run.stage == 1:
 		_set_hint("[color=#ffd75e]カードをタップ[/color] → [color=#7fe8ff]光るマスをタップ[/color]で動く。1ターンに2回まで。\nオレンジの扇は敵の視界。そこで止まると見つかる！")
@@ -579,7 +646,7 @@ func _boss_intro() -> void:
 
 func _floor_banner() -> void:
 	var v := _view()
-	var z := run.stage - 1
+	var z := run.zone()
 	var box := Control.new()
 	box.position = Vector2(-v.x, v.y * 0.38)
 	box.size = Vector2(v.x, 150)
@@ -591,7 +658,7 @@ func _floor_banner() -> void:
 	band.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	box.add_child(band)
 	_label("%s　%s" % Scenario.ZONES[z], 54, Vector2(0, 14), box, UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("%d階　・　深さ %dm" % [run.stage, run.stage * 120] if not run.is_boss_stage() else "最深部　・　深さ ???m", 32, Vector2(0, 90), box, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("%s　%d階　・　深さ %dm" % [run.course.name, run.stage, run.stage * 100] if not run.is_boss_stage() else "%s　最深部　・　深さ ???m" % run.course.name, 30, Vector2(0, 90), box, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	var tw := box.create_tween()
 	tw.tween_property(box, "position:x", 0.0, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 	tw.tween_interval(1.0)
@@ -619,30 +686,53 @@ func _mini_banner(text: String, col: Color) -> void:
 	tw.tween_callback(l.queue_free)
 
 
-## 画面の向きに合わせて、情報・手札・ボタンの位置を決める
+## 画面の向きに合わせて、情報・手札・ボタンの位置を決める。
+## 横画面（PC）はマップを左、手札と情報を右の列にまとめて、マップとカードが重ならないようにする
+const SIDE_W := 470.0
+
+
 func _layout() -> Dictionary:
 	var v := _view()
 	if Screen.portrait:
 		var hand_h := 196.0
-		return {"hud": Rect2(10, 8, v.x - 20, 104), "hint": Rect2(10, 118, v.x - 20, 70),
-			"hand": Rect2(8, v.y - hand_h - 14, v.x - 16, hand_h), "card_w": 128.0,
+		return {"map": Rect2(Vector2.ZERO, v), "hud": Rect2(10, 8, v.x - 20, 104), "hint": Rect2(10, 118, v.x - 20, 70),
+			"hand": Rect2(8, v.y - hand_h - 14, v.x - 16, hand_h), "card_w": 128.0, "cols": 99,
 			"end": Rect2(v.x - 200, v.y - hand_h - 100, 188, 70), "rot": Vector2(14, v.y - hand_h - 94),
+			"deck": Rect2(236, v.y - hand_h - 94, 120, 64), "relics": Vector2(12, 196),
 			"mode": Rect2(10, v.y - hand_h - 176, v.x - 20, 64), "speech": Vector2(v.x / 2, 200),
 			"top": 190.0, "bottom": hand_h + 110.0}
-	var hand_h2 := 168.0
-	return {"hud": Rect2(10, 8, 500, 104), "hint": Rect2(520, 8, v.x - 530, 70),
-		"hand": Rect2(220, v.y - hand_h2 - 10, v.x - 440, hand_h2), "card_w": 112.0,
-		"end": Rect2(v.x - 204, v.y - 96, 190, 74), "rot": Vector2(16, v.y - 90),
-		"mode": Rect2(220, v.y - hand_h2 - 84, v.x - 440, 62), "speech": Vector2(v.x / 2, 90),
-		"top": 80.0, "bottom": hand_h2 + 40.0}
+	var x0 := v.x - SIDE_W + 4
+	var pw := SIDE_W - 14
+	var map_w := v.x - SIDE_W
+	return {"map": Rect2(0, 0, map_w, v.y), "hud": Rect2(x0, 8, pw, 104), "hint": Rect2(x0, 118, pw, 112),
+		"mode": Rect2(x0, 238, pw, 56), "hand": Rect2(x0, 308, pw, v.y - 308 - 92), "card_w": 104.0, "cols": 4,
+		"end": Rect2(v.x - 214, v.y - 84, 200, 72), "deck": Rect2(x0, v.y - 84, 130, 72), "rot": Vector2(16, v.y - 80),
+		"relics": Vector2(14, 12), "speech": Vector2(map_w / 2, 70), "top": 0.0, "bottom": 0.0, "side": Rect2(map_w, 0, SIDE_W, v.y)}
+
+
+## マップ（3D）の置き場所
+func _place_world() -> void:
+	if world == null:
+		return
+	var L := _layout()
+	world.position = L.map.position
+	world.size = L.map.size
+	world.top_margin = L.top
+	world.bottom_margin = L.bottom
 
 
 func _build_play() -> void:
 	_clear_ui()
 	var L := _layout()
-	if world:
-		world.top_margin = L.top
-		world.bottom_margin = L.bottom
+	_place_world()
+	if L.has("side"):
+		# 横画面：右の列の下地
+		var side := ColorRect.new()
+		side.color = Color(0.01, 0.04, 0.09, 0.92)
+		side.position = L.side.position
+		side.size = L.side.size
+		side.mouse_filter = Control.MOUSE_FILTER_STOP
+		_ui.add_child(side)
 	_hud = Hud.new()
 	_hud.position = L.hud.position
 	_hud.size = L.hud.size
@@ -672,6 +762,15 @@ func _build_play() -> void:
 		b.size = Vector2(64, 64)
 		b.position = rot + Vector2(i * 72, 0)
 		_ui.add_child(b)
+	_deck_btn = _button("デッキ", func(): _view_deck(), 24, Color(0.3, 0.35, 0.55))
+	_deck_btn.position = L.deck.position
+	_deck_btn.size = L.deck.size
+	_ui.add_child(_deck_btn)
+	_relic_bar = Control.new()
+	_relic_bar.position = L.relics
+	_relic_bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ui.add_child(_relic_bar)
+	_build_relic_bar()
 	_end_btn = _button("ターン終了", _on_end_turn, 28, Color(0.75, 0.4, 0.15))
 	_end_btn.position = L.end.position
 	_end_btn.size = L.end.size
@@ -701,15 +800,22 @@ func _rebuild_hand() -> void:
 	var n := run.hand.size()
 	var box: Rect2 = L.hand
 	var cw: float = L.card_w
+	var cols: int = mini(int(L.cols), maxi(n, 1))
 	var gap := 8.0
-	if n * (cw + gap) > box.size.x:
-		cw = box.size.x / n - gap
-	var total := n * (cw + gap) - gap
+	if cols * (cw + gap) > box.size.x:
+		cw = box.size.x / cols - gap
+	var rows: int = ceili(n / float(cols))
+	var ch := minf(cw * 1.45, (box.size.y - 8) / rows - (14 if rows > 1 else 0))
+	cw = minf(cw, ch / 1.45)
 	for i in n:
 		var cv := CardView.new(run.hand[i])
 		cv.index = i
-		cv.size = Vector2(cw, minf(box.size.y - 8, cw * 1.45))
-		cv.position = Vector2(box.size.x / 2 - total / 2 + i * (cw + gap), box.size.y - cv.size.y)
+		cv.size = Vector2(cw, ch)
+		var r := i / cols
+		var in_row := mini(cols, n - r * cols)
+		var total := in_row * (cw + gap) - gap
+		var y := box.size.y - ch if rows == 1 else 22 + r * (ch + 14)
+		cv.position = Vector2(box.size.x / 2 - total / 2 + (i % cols) * (cw + gap), y)
 		cv.tapped.connect(_on_card)
 		_hand_box.add_child(cv)
 		_cards.append(cv)
@@ -868,10 +974,15 @@ func _show_enemy(u: Dictionary) -> void:
 		"search": "さがしている", "return": "持ち場に戻る", "sleep": "眠っている（近づくと起きる）"}.get(u.state, "")
 	if u.stun > 0:
 		st = "気絶中（1回休み）"
-	var note: String = {"patrol": "決まった道を行ったり来たり", "sentry": "その場で向きを変える", "fixed": "動かない。前とまわりにかみつく",
-		"drift": "目が見えない。ふらふら動いて、となりを刺す",
-		"boss": "赤く光るマスに次のターン攻撃。泡のブレスか音波で気絶させると止まる。押し出せない"}[u.move]
-	_set_hint("[b]%s[/b]　体力 %d/%d　攻撃 %d　%s\n[color=#9fb4c8]%s[/color]" % [d.name, u.hp, u.max_hp, u.atk, st, note])
+	var note: String = d.note
+	if u.get("elite", false):
+		note = "[color=#ffd75e]ぬし：倒すとお守りが手に入る[/color]　" + note
+	if u.move == "boss":
+		if u.get("guard", 0) > 0:
+			st += "　[color=#ffb070]気絶しない（あと%dターン）[/color]" % u.guard
+		if u.get("phase2", false):
+			st += "　[color=#ff6a6a]怒っている[/color]"
+	_set_hint("[b]%s%s[/b]　体力 %d/%d　攻撃 %d　%s\n[color=#9fb4c8]%s[/color]" % ["ぬしの" if u.get("elite", false) else "", d.name, u.hp, u.max_hp, u.atk, st, note])
 	var cells := {}
 	for q in run.vision(u):
 		cells[q] = Color(1, 0.4, 0.2, 0.55)
@@ -1036,6 +1147,59 @@ func _run_events(ev: Array, step: float) -> void:
 				_mini_banner("海竜が目をさました！", Color(0.6, 0.9, 1.0))
 				_say(Scenario.SAY_BOSS_WAKE)
 				await _wait(0.9)
+			"boss_phase":
+				var bv := world.view(e.id)
+				if bv:
+					bv.pose(3, 1.4)
+				Audio.sfx("roar")
+				world.shake(2.5)
+				_mini_banner("海竜が怒った！", Color(1, 0.4, 0.35))
+				_say_line("怒らせちゃった！　攻撃が重なってくるよ！", "きゅーっ！", "shake")
+				await _wait(0.9)
+			"summon":
+				var su = run.unit_by_id(e.id)
+				if su != null:
+					var nv := world.add_unit(su)
+					world.burst(nv.position, Color(0.6, 0.85, 1.0, 0.85), 16)
+					Audio.sfx("alert", -4.0)
+					await _wait(0.25)
+			"resist":
+				var bv := world.view(e.id)
+				if bv:
+					world.pop_text(bv.position + Vector3(0, 1.2, 0), "気絶しない！", Color(1, 0.6, 0.4), 64)
+				Audio.sfx("bump")
+				await _wait(0.2)
+			"coin":
+				world.pop_text(world.cell3(e.at) + Vector3(0, 0.4, 0), "+%d コイン" % e.n, UiStyle.GOLD, 60)
+				Audio.sfx("coin", -4.0)
+				_hud.queue_redraw()
+			"relic":
+				if e.get("chest", false):
+					world.remove_item(e.at)
+				world.burst(world.cell3(e.at), Color(1, 0.85, 0.4, 0.95), 24)
+				await _relic_popup(e.id, "金の宝箱からお守り！" if e.get("chest", false) else "ぬしを倒してお守りを手に入れた！")
+				_build_relic_bar()
+			"revive":
+				world.pop_text(world.view(0).position + Vector3(0, 0.4, 0), "ミラのリボン！　体力5で起きた", UiStyle.PINK, 60)
+				world.burst(world.view(0).position, Color(1, 0.6, 0.85, 0.9), 24)
+				Audio.sfx("star")
+				await _mira_fly(run.me().pos, true)
+				_build_relic_bar()
+			"ink":
+				world.pop_text(world.view(0).position, "墨をかけられた！", Color(0.6, 0.55, 0.75), 60)
+				Audio.sfx("bump")
+				if not _said.has("ink"):
+					_said.ink = true
+					_say_line("うえっ、墨！　じゃまなカードがまざっちゃった", "きゅ……", "droop")
+			"ink_clear":
+				world.pop_text(world.view(0).position, "墨をふきとった", Color(0.8, 0.8, 0.9), 52)
+			"weed":
+				world.add_weed(e.at)
+				Audio.sfx("stash")
+				await _mira_fly(e.at)
+			"cheer":
+				world.pop_text(world.view(0).position, "行動 +%d" % e.n, UiStyle.GOLD, 64)
+				await _mira_fly(run.me().pos, true)
 			"warn":
 				world.set_danger(e.tiles)
 				if e.get("cancel", false):
@@ -1050,7 +1214,7 @@ func _run_events(ev: Array, step: float) -> void:
 					var bv := world.view(e.id)
 					if bv:
 						bv.pose(3, 0.8)
-						world.pop_text(bv.position + Vector3(0, 1.4, 0), Tactics.BOSS_ATTACKS[e.kind].name + "の構え", Color(1, 0.5, 0.45), 64)
+						world.pop_text(bv.position + Vector3(0, 1.4, 0), e.get("name", Tactics.BOSS_ATTACKS[e.kind].name) + "の構え", Color(1, 0.5, 0.45), 64)
 					Audio.sfx("warn")
 					if not _said.has("warn"):
 						_said.warn = true
@@ -1061,8 +1225,9 @@ func _run_events(ev: Array, step: float) -> void:
 				if bv:
 					bv.pose(3, 0.8)
 				Audio.sfx("breath" if e.kind == "breath" else ("roar" if e.kind == "tail" else "whoosh"))
+				var rc: Color = {"whirl": Color(0.3, 0.6, 1.0, 0.9), "rain": Color(1.0, 0.85, 0.4, 0.9)}.get(e.kind, Color(0.5, 0.9, 1.0, 0.9))
 				for q in e.tiles:
-					world.ring(q, 0.7, Color(0.5, 0.9, 1.0, 0.9) if e.kind != "whirl" else Color(0.3, 0.6, 1.0, 0.9), 0.4)
+					world.ring(q, 0.7, rc, 0.4)
 				world.shake(1.5)
 				await _wait(0.4)
 			"star":
@@ -1096,9 +1261,10 @@ func _run_events(ev: Array, step: float) -> void:
 			"call":
 				await _mira_fly(e.at)
 			"beam":
-				var col := Color(0.6, 0.9, 1.0, 0.9) if e.kind == "bubble" else Color(0.95, 0.95, 1.0, 0.9)
-				Audio.sfx("bubble" if e.kind == "bubble" else "sonar")
-				var tw := world.beam(e.from, e.dir, 9, col)
+				var col: Color = {"bubble": Color(0.6, 0.9, 1.0, 0.9), "horn": Color(1.0, 0.95, 0.7, 0.95),
+					"tide": Color(0.3, 0.6, 1.0, 0.9)}.get(e.kind, Color(0.95, 0.95, 1.0, 0.9))
+				Audio.sfx("bubble" if e.kind in ["bubble", "tide"] else ("whoosh" if e.kind == "horn" else "sonar"))
+				var tw := world.beam(e.from, e.dir, int(e.get("n", 9)), col)
 				await tw.finished
 			"whirl":
 				Audio.sfx("whoosh")
@@ -1137,7 +1303,8 @@ func _run_events(ev: Array, step: float) -> void:
 				pass
 			"pickup":
 				world.remove_item(e.at)
-				Audio.sfx("gem" if e.item == "pearl" else "bubble")
+				if e.item != "coin":
+					Audio.sfx("gem" if e.item == "pearl" else "bubble")
 				if e.item == "vent" and not _said.has("vent"):
 					_said.vent = true
 					_say(Scenario.SAY_VENT)
@@ -1149,7 +1316,7 @@ func _run_events(ev: Array, step: float) -> void:
 				if not _said.has("chest"):
 					_said.chest = true
 					_say(Scenario.SAY_CHEST)
-				await _choose_card(run.reward_choices(), "宝箱を開けた！", "カードを1枚えらんで、デッキに入れる")
+				await _choose_card(run.chest_choices(), "宝箱を開けた！", "カードを1枚えらんで、デッキに入れる")
 			"exit":
 				pass
 			"suffocate":
@@ -1224,6 +1391,119 @@ func _choose_card(ids: Array, title: String, sub: String) -> void:
 	shade.queue_free()
 
 
+## 持っているお守りを並べる。タップで説明
+func _build_relic_bar() -> void:
+	if _relic_bar == null or run == null:
+		return
+	for c in _relic_bar.get_children():
+		c.queue_free()
+	for i in run.relics.size():
+		var id: String = run.relics[i]
+		var icon := _relic_icon(id, 46)
+		icon.position = Vector2(i * 52, 0)
+		icon.mouse_filter = Control.MOUSE_FILTER_STOP
+		icon.gui_input.connect(func(e):
+			if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+				var d := Relics.def(id)
+				_set_hint("[b][color=#ffd75e]%s[/color][/b]　%s" % [d.name, d.desc]))
+		icon.tooltip_text = Relics.def(id).name
+		_relic_bar.add_child(icon)
+
+
+func _relic_icon(id: String, sz: float) -> TextureRect:
+	var tr := TextureRect.new()
+	var p := "res://assets/images/ui/relics.png"
+	if ResourceLoader.exists(p):
+		var at := AtlasTexture.new()
+		at.atlas = load(p)
+		var cell: float = at.atlas.get_size().x / 4.0
+		var ix: int = Relics.def(id).icon
+		at.region = Rect2((ix % 4) * cell, (ix / 4) * cell, cell, cell)
+		tr.texture = at
+	tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	tr.size = Vector2(sz, sz)
+	tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return tr
+
+
+## お守りを手に入れたときの大きな表示
+func _relic_popup(id: String, title: String) -> void:
+	var v := _view()
+	var d := Relics.def(id)
+	var shade := ColorRect.new()
+	shade.color = Color(0, 0.02, 0.06, 0.75)
+	shade.size = v
+	shade.z_index = 150
+	shade.mouse_filter = Control.MOUSE_FILTER_STOP
+	_ui.add_child(shade)
+	Audio.sfx("star", -2.0)
+	_label(title, 40, Vector2(0, v.y * 0.24), shade, UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	var icon := _relic_icon(id, 180)
+	icon.position = Vector2(v.x / 2 - 90, v.y * 0.24 + 70)
+	icon.pivot_offset = Vector2(90, 90)
+	icon.scale = Vector2(0.2, 0.2)
+	shade.add_child(icon)
+	var tw := icon.create_tween()
+	tw.tween_property(icon, "scale", Vector2.ONE, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	_label(d.name, 36, Vector2(0, v.y * 0.24 + 270), shade, Color.WHITE, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	_label(d.desc, 26, Vector2(0, v.y * 0.24 + 320), shade, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	var ok := _button("やった！", func(): _picked.emit(""), 28, Color(0.1, 0.5, 0.85))
+	ok.size = Vector2(240, 66)
+	ok.position = Vector2(v.x / 2 - 120, v.y * 0.24 + 380)
+	shade.add_child(ok)
+	await _picked
+	shade.queue_free()
+
+
+## デッキを見る（遊んでいる途中）
+func _view_deck() -> void:
+	if _busy or run == null:
+		return
+	await _pick_deck("デッキ（%d枚）" % run.owned.size(), Callable(), "とじる")
+
+
+## デッキのカードを1枚えらぶ。filter が false のカードは暗くして選べない。何も選ばなければ ""
+func _pick_deck(title: String, filter: Callable, cancel: String = "やめる") -> String:
+	var v := _view()
+	var shade := ColorRect.new()
+	shade.color = Color(0, 0.02, 0.06, 0.9)
+	shade.size = v
+	shade.z_index = 160
+	shade.mouse_filter = Control.MOUSE_FILTER_STOP
+	_ui.add_child(shade)
+	_label(title, 38, Vector2(0, 24), shade, UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
+	var sc := ScrollContainer.new()
+	sc.position = Vector2(20, 84)
+	sc.size = Vector2(v.x - 40, v.y - 84 - 110)
+	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	shade.add_child(sc)
+	var cw := 120.0
+	var grid := GridContainer.new()
+	grid.columns = maxi(int((v.x - 60) / (cw + 14)), 1)
+	grid.add_theme_constant_override("h_separation", 14)
+	grid.add_theme_constant_override("v_separation", 18)
+	sc.add_child(grid)
+	var ids := run.owned.duplicate()
+	ids.sort_custom(func(a, b): return Cards.def(a).kind + a < Cards.def(b).kind + b)
+	for id in ids:
+		var cv := CardView.new(id)
+		cv.custom_minimum_size = Vector2(cw, cw * 1.45 + 10)
+		cv.playable = not filter.is_valid() or filter.call(id)
+		if filter.is_valid() and cv.playable:
+			cv.tapped.connect(func(_c):
+				Audio.sfx("card")
+				_picked.emit(id))
+		grid.add_child(cv)
+	var close := _button(cancel, func(): _picked.emit(""), 26, Color(0.35, 0.4, 0.5))
+	close.size = Vector2(240, 64)
+	close.position = Vector2(v.x / 2 - 120, v.y - 90)
+	shade.add_child(close)
+	var got: String = await _picked
+	shade.queue_free()
+	return got
+
+
 func _say(arr: Array) -> void:
 	var trip: Array = Scenario.pick(arr)
 	_say_line(trip[0], trip[1], trip[2])
@@ -1295,20 +1575,30 @@ func _on_exit() -> void:
 		_mini_banner("見つからずに抜けた！", UiStyle.GOLD)
 	await _wait(0.9)
 	_busy = false
-	best_floor = maxi(best_floor, run.stage)
-	_save()
+	_record(false)
 	if run.cleared:
 		_on_star()
 		return
 	_rest_picks = 2 if run.spotted == 0 else 1
 	_rest_choices = run.reward_choices(3)
+	_stock = {}
 	_show_rest()
 
 
-func _on_star() -> void:
-	clears += 1
-	best_floor = Tactics.STAGES
+## コースごとの記録（最高の階・クリア回数）
+func _record(clear: bool) -> void:
+	var rec: Dictionary = records.get(run.course_id, {"clears": 0, "best": 0})
+	rec.best = maxi(int(rec.best), run.stage)
+	if clear:
+		rec.clears = int(rec.clears) + 1
+		clears += 1
+	records[run.course_id] = rec
+	best_floor = maxi(best_floor, run.stage)
 	_save()
+
+
+func _on_star() -> void:
+	_record(true)
 	_result = {"kind": "clear"}
 	Audio.jingle("surface")
 	await _wait(1.0)
@@ -1325,8 +1615,7 @@ func _on_faint() -> void:
 	world.view(-1).pose(2, 2.0)
 	await _wait(1.2)
 	_busy = false
-	best_floor = maxi(best_floor, run.stage)
-	_save()
+	_record(false)
 	_result = {"kind": "faint"}
 	_talk(Scenario.FAINT_TALK, _show_result)
 
@@ -1336,7 +1625,7 @@ func _show_rest() -> void:
 	state = REST
 	_clear_ui()
 	_drop_world()
-	_set_bg(BGS[mini(run.stage, 3)], 0.45, 0.6)
+	_set_bg(BGS[mini(run.zone() + 1, 3)], 0.45, 0.6)
 	Audio.bgm("rest")
 	var full := _view()
 	var portrait := Screen.portrait
@@ -1353,7 +1642,7 @@ func _show_rest() -> void:
 	var top := 36.0 if portrait else 70.0
 	_label("空気だまり", 54, Vector2(0, top), left, UiStyle.AQUA, v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	_label("%d階を抜けた！　体力+4・空気満タンで次へ" % run.stage, 22, Vector2(0, top + 72), left, Color.WHITE, v.x, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("体力 %d/%d　デッキ %d枚　倒した敵 %d" % [run.hp, run.max_hp, run.owned.size(), run.kills], 24, Vector2(0, top + 112), left,
+	_label("体力 %d/%d　デッキ %d枚　コイン %d" % [run.hp, run.max_hp, run.owned.size(), run.coins], 24, Vector2(0, top + 112), left,
 		UiStyle.GOLD, v.x, HORIZONTAL_ALIGNMENT_CENTER)
 	var mini_y := top + 150
 	var c := MiniChar.new("canopus")
@@ -1385,7 +1674,7 @@ func _show_rest() -> void:
 		var id: String = _rest_choices[i]
 		var cv := CardView.new(id)
 		cv.size = Vector2(cw, cw * 1.45)
-		cv.position = Vector2(v.x / 2 - total / 2 + i * (cw + 16), cy + 76)
+		cv.position = Vector2(v.x / 2 - total / 2 + i * (cw + 16), cy + 96)
 		cv.playable = _rest_picks > 0
 		cv.tapped.connect(func(_c):
 			if _rest_picks <= 0:
@@ -1400,12 +1689,166 @@ func _show_rest() -> void:
 		var desc := _label(d.desc, 18, Vector2(cv.position.x - 6, cv.position.y + cw * 1.45 + 6), right, Color(0.9, 0.95, 1.0), cw + 12,
 			HORIZONTAL_ALIGNMENT_CENTER)
 		desc.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	var go := _button("ヤドカリのお店へ", func():
+		_show_shop(), 30, Color(0.75, 0.45, 0.15))
+	go.size = Vector2(320, 80)
+	go.position = Vector2(v.x / 2 - 160, cy + 96 + cw * 1.45 + 76)
+	right.add_child(go)
+
+
+## ヤドカリのお店：コインでカード・お守りを買う。カードの強化・捨てる・回復もできる
+func _show_shop() -> void:
+	state = SHOP
+	_clear_ui()
+	_drop_world()
+	_set_bg(BGS[mini(run.zone() + 1, 3)], 0.6, 0.5)
+	if _stock.is_empty():
+		_stock = run.shop_stock()
+		_stock.sold = []
+		_stock.removes = 0
+		_shop_say = Scenario.pick(Scenario.SHOP_HELLO)
+		Audio.sfx("coin")
+	var v := _view()
+	var portrait := Screen.portrait
+	# 店主と所持金
+	var head := Control.new()
+	head.size = Vector2(v.x if portrait else v.x * 0.34, 330 if portrait else v.y)
+	head.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ui.add_child(head)
+	var hw := head.size.x
+	_label("ヤドカリ屋", 46, Vector2(0, 20), head, UiStyle.GOLD, hw, HORIZONTAL_ALIGNMENT_CENTER)
+	var keeper := MiniChar.new("yadokari")
+	keeper.size = Vector2(150, 150)
+	keeper.position = Vector2(30, 70) if portrait else Vector2(hw / 2 - 75, 80)
+	head.add_child(keeper)
+	keeper.act(MiniChar.HAPPY, 1.0, true)
+	var say := _label(_shop_say, 22, Vector2(200, 110) if portrait else Vector2(20, 240), head, Color.WHITE,
+		hw - 220 if portrait else hw - 40, HORIZONTAL_ALIGNMENT_CENTER)
+	say.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	var money := _label("コイン %d" % run.coins, 34, Vector2(0, 240 if portrait else 330), head, UiStyle.GOLD, hw, HORIZONTAL_ALIGNMENT_CENTER)
+	money.name = "money"
+	_label("体力 %d/%d　デッキ %d枚" % [run.hp, run.max_hp, run.owned.size()], 22, Vector2(0, 284 if portrait else 380), head,
+		Color(0.85, 0.92, 1.0), hw, HORIZONTAL_ALIGNMENT_CENTER)
+	# 品物
+	var body := Control.new()
+	body.position = Vector2(0, 330) if portrait else Vector2(v.x * 0.34, 0)
+	body.size = Vector2(v.x, v.y - 330) if portrait else Vector2(v.x * 0.66, v.y)
+	body.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ui.add_child(body)
+	var bw := body.size.x
+	var y := 10.0 if portrait else 30.0
+	_label("カード", 26, Vector2(24, y), body, UiStyle.AQUA)
+	var cards: Array = _stock.cards
+	var cw: float = minf(150.0, (bw - 60) / 4.0 - 14)
+	for i in cards.size():
+		var id: String = cards[i]
+		var sold: bool = ("c%d" % i) in _stock.sold
+		var cv := CardView.new(id)
+		cv.size = Vector2(cw, cw * 1.45)
+		cv.position = Vector2(bw / 2 - 2 * (cw + 14) + 7 + i * (cw + 14), y + 40)
+		cv.price = Cards.price(id)
+		cv.playable = not sold and run.coins >= cv.price
+		cv.visible = not sold
+		cv.tapped.connect(func(_c):
+			_buy("c%d" % i, Cards.price(id), func(): run.add_card(id), Cards.def(id).name))
+		body.add_child(cv)
+		var desc := _label(Cards.def(id).desc, 16, Vector2(cv.position.x - 6, cv.position.y + cw * 1.45 + cw * 0.26 + 6), body,
+			Color(0.9, 0.95, 1.0), cw + 12, HORIZONTAL_ALIGNMENT_CENTER)
+		desc.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		desc.visible = not sold
+	y += 40 + cw * 1.45 + cw * 0.26 + 64
+	_label("お守り", 26, Vector2(24, y), body, UiStyle.AQUA)
+	var rel: Array = _stock.relics
+	var rw: float = minf(330.0, (bw - 60) / 2.0)
+	for i in rel.size():
+		var id: String = rel[i]
+		var d := Relics.def(id)
+		var key := "r%d" % i
+		if key in _stock.sold:
+			continue
+		var b := _button("", func(): _buy(key, int(d.price), func(): run.add_relic(id), d.name), 20, Color(0.35, 0.25, 0.5))
+		b.position = Vector2(bw / 2 - rw - 8 + i * (rw + 16), y + 40)
+		b.size = Vector2(rw, 110)
+		b.disabled = run.coins < int(d.price)
+		body.add_child(b)
+		var icon := _relic_icon(id, 80)
+		icon.position = Vector2(10, 15)
+		b.add_child(icon)
+		_label(d.name, 22, Vector2(98, 8), b, UiStyle.GOLD)
+		var dl := _label(d.desc, 17, Vector2(98, 38), b, Color.WHITE, rw - 108)
+		dl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		_label("%dコイン" % d.price, 20, Vector2(rw - 120, 80), b, UiStyle.GOLD, 110, HORIZONTAL_ALIGNMENT_RIGHT)
+	y += 40 + 110 + 30
+	# サービス
+	var rm_cost: int = Tactics.REMOVE_COST + int(_stock.removes) * 15
+	var svc := [["カードを強化 %d" % Tactics.UPGRADE_COST, Tactics.UPGRADE_COST, "up"],
+		["カードを捨てる %d" % rm_cost, rm_cost, "rm"], ["体力+%d　%d" % [Tactics.HEAL_AMOUNT, Tactics.HEAL_COST], Tactics.HEAL_COST, "heal"]]
+	var sw: float = minf(260.0, (bw - 60) / 3.0 - 10)
+	for i in svc.size():
+		var sv: Array = svc[i]
+		var b := _button(sv[0], func(): _service(sv[2], sv[1]), 20, Color(0.2, 0.45, 0.4))
+		b.position = Vector2(bw / 2 - 1.5 * sw - 12 + i * (sw + 12), y)
+		b.size = Vector2(sw, 64)
+		b.disabled = run.coins < int(sv[1]) or (sv[2] == "heal" and run.hp >= run.max_hp)
+		body.add_child(b)
 	var go := _button("次の階へもぐる", func():
 		Audio.sfx("dive")
 		_start_stage(run.next_stage()), 30, Color(0.1, 0.5, 0.85))
-	go.size = Vector2(320, 80)
-	go.position = Vector2(v.x / 2 - 160, cy + 76 + cw * 1.45 + 76)
-	right.add_child(go)
+	go.size = Vector2(340, 80)
+	if portrait:
+		go.position = Vector2(bw / 2 - 170, minf(y + 90, body.size.y - 96))
+		body.add_child(go)
+	else:
+		go.position = Vector2(hw / 2 - 170, v.y - 120)
+		head.add_child(go)
+
+
+func _buy(key: String, price: int, give: Callable, what: String) -> void:
+	if key in _stock.sold:
+		return
+	if not run.spend(price):
+		Audio.sfx("bump")
+		_shop_say = Scenario.pick(Scenario.SHOP_POOR)
+		_show_shop()
+		return
+	Audio.sfx("buy")
+	_stock.sold.append(key)
+	_shop_say = Scenario.pick(Scenario.SHOP_THANKS) % what
+	give.call()
+	_show_shop()
+
+
+func _service(kind: String, price: int) -> void:
+	if run.coins < price:
+		Audio.sfx("bump")
+		return
+	match kind:
+		"up":
+			var id := await _pick_deck("強化するカードをえらぶ（%dコイン）" % price, func(c): return Cards.can_upgrade(c))
+			if id == "" or not run.spend(price):
+				return
+			run.upgrade_card(id)
+			Audio.sfx("upgrade")
+			_shop_say = "「%s」をピカピカにしといたよ！" % Cards.def(Cards.upgraded(id)).name
+		"rm":
+			if run.owned.size() <= 5:
+				_shop_say = "それ以上へらすと、泳げなくなっちゃうよ"
+				_show_shop()
+				return
+			var id := await _pick_deck("捨てるカードをえらぶ（%dコイン）" % price, func(_c): return true)
+			if id == "" or not run.spend(price):
+				return
+			run.remove_card(id)
+			_stock.removes = int(_stock.removes) + 1
+			Audio.sfx("stash")
+			_shop_say = "「%s」はうちで引き取るよ" % Cards.def(id).name
+		"heal":
+			if not run.spend(price):
+				return
+			run.hp = mini(run.hp + Tactics.HEAL_AMOUNT, run.max_hp)
+			Audio.sfx("block")
+			_shop_say = "海藻スープだよ。あったまるでしょ"
+	_show_shop()
 
 
 func _show_result() -> void:
@@ -1414,7 +1857,7 @@ func _show_result() -> void:
 	_drop_world()
 	var v := _view()
 	var kind: String = _result.get("kind", "faint")
-	_set_bg("ev_clear" if kind == "clear" else BGS[run.stage - 1], 0.45 if kind == "clear" else 0.35, 0.3)
+	_set_bg("ev_clear" if kind == "clear" else BGS[mini(run.zone(), 3)], 0.45 if kind == "clear" else 0.35, 0.3)
 	var title: String = {"faint": "ミラに助けられた……", "clear": "星のかけらを見つけた！"}[kind]
 	var portrait := Screen.portrait
 	var mx := v.x / 2 if portrait else v.x * 0.3
@@ -1442,12 +1885,13 @@ func _show_result() -> void:
 		c.act(MiniChar.HAPPY, 99, true)
 		m.act(MiniChar.HAPPY, 99, true)
 	var y := v.y * 0.24 + 230 if portrait else 150.0
-	_label("海竜をたおして星を取りもどした" if kind == "clear" else "%s %d階まで" % [Scenario.ZONES[run.stage - 1][0], run.stage], 34, Vector2(0, y), col, UiStyle.AQUA, cw, HORIZONTAL_ALIGNMENT_CENTER)
-	_label("倒した敵 %d　見つかった %d回" % [run.kills, run.spotted_total], 30, Vector2(0, y + 56), col, UiStyle.GOLD, cw, HORIZONTAL_ALIGNMENT_CENTER)
-	var sub := "クリア %d回目！" % clears if kind == "clear" else ("今までの最高：%d階" % best_floor)
+	_label(run.course.name + ("　海竜をたおした！" if kind == "clear" else "　%s %d階まで" % [Scenario.ZONES[run.zone()][0], run.stage]), 32, Vector2(0, y), col, UiStyle.AQUA, cw, HORIZONTAL_ALIGNMENT_CENTER)
+	_label("倒した敵 %d　見つかった %d回\n集めたコイン %d　お守り %d個" % [run.kills, run.spotted_total, run.coins_total, run.relics.size()], 26, Vector2(0, y + 50), col, UiStyle.GOLD, cw, HORIZONTAL_ALIGNMENT_CENTER)
+	var rec: Dictionary = records.get(run.course_id, {})
+	var sub := "このコース %d回目のクリア！" % int(rec.get("clears", 1)) if kind == "clear" else ("このコースの最高：%d階" % int(rec.get("best", run.stage)))
 	_label(sub, 30, Vector2(0, y + 116), col, UiStyle.PINK if kind == "clear" else Color.WHITE, cw, HORIZONTAL_ALIGNMENT_CENTER)
 	var bw := 300.0
-	var again := _button("もう一度もぐる", _start_run, 32, Color(0.1, 0.5, 0.85))
+	var again := _button("もう一度もぐる", _show_courses, 32, Color(0.1, 0.5, 0.85))
 	again.size = Vector2(bw, 84)
 	again.position = Vector2(cw / 2 - bw / 2, y + 196)
 	col.add_child(again)
@@ -1474,7 +1918,7 @@ func _unhandled_input(e: InputEvent) -> void:
 			match e.keycode:
 				KEY_F1:
 					run.exited = true
-					run.cleared = run.stage >= Tactics.STAGES
+					run.cleared = run.is_boss_stage()
 					_on_exit()
 				KEY_F3:
 					run.hp = 1
@@ -1485,8 +1929,12 @@ func _unhandled_input(e: InputEvent) -> void:
 					_on_star()
 				KEY_F10:
 					# ボスの階へ
-					run.stage = Tactics.STAGES
+					run.stage = run.stages()
 					_start_stage(run.start_stage())
+				KEY_F11:
+					# コイン+100（お店の確認用）
+					run.coins += 100
+					_refresh()
 				KEY_F9:
 					# いちばん出口に近づける泳ぎ方を自動で選ぶ（画面確認用）
 					_debug_step()
@@ -1548,13 +1996,20 @@ class Hud extends Control:
 		draw_style_box(UiStyle.panel(Color(0.5, 0.85, 1.0, 0.6), Color(0.02, 0.07, 0.15, 0.85)), Rect2(Vector2.ZERO, size))
 		var font := get_theme_default_font()
 		var t := Time.get_ticks_msec() / 1000.0
-		var z := run.stage - 1
+		var z := run.zone()
 		_text(font, "%s %d階" % [Scenario.ZONES[z][0], run.stage], Vector2(16, 34), 24, UiStyle.GOLD)
-		_text(font, "ターン %d" % run.turn, Vector2(140, 34), 20, Color(0.85, 0.92, 1.0))
+		# コイン
+		var cx := 150.0 if size.x < 600 else 170.0
+		draw_circle(Vector2(cx, 26), 11, UiStyle.GOLD)
+		draw_circle(Vector2(cx, 26), 6, Color(0.85, 0.6, 0.1))
+		_text(font, str(run.coins), Vector2(cx + 16, 34), 22, UiStyle.GOLD)
+		if size.x >= 600:
+			_text(font, "ターン %d" % run.turn, Vector2(260, 34), 20, Color(0.85, 0.92, 1.0))
 		# 行動回数
-		_text(font, "行動", Vector2(size.x - 196, 34), 22, Color(0.85, 0.92, 1.0))
-		for i in Tactics.PLAYS:
-			var c := Vector2(size.x - 130 + i * 30, 26)
+		var np: int = maxi(Tactics.PLAYS, run.plays_left)
+		_text(font, "行動", Vector2(size.x - 166 - np * 30, 34), 22, Color(0.85, 0.92, 1.0))
+		for i in np:
+			var c := Vector2(size.x - 100 - (np - i) * 30, 26)
 			if i < run.plays_left:
 				draw_circle(c, 11 + sin(t * 5.0) * 1.0, UiStyle.GOLD)
 			else:
@@ -1563,7 +2018,7 @@ class Hud extends Control:
 		var w: float = size.x - 30
 		_bar(font, Vector2(16, 48), w, "体力", run.hp, run.max_hp, UiStyle.HEART if run.hp > 4 else Color(1, 0.3 + 0.2 * sin(t * 8.0), 0.3))
 		var air_col := UiStyle.AIR if run.air > 5 else Color(1, 0.5 + 0.3 * sin(t * 8.0), 0.5)
-		_bar(font, Vector2(16, 74), w, "空気", run.air, maxi(run.air, Tactics.MAX_AIR), air_col)
+		_bar(font, Vector2(16, 74), w, "空気", run.air, maxi(run.air, run.max_air), air_col)
 
 	func _bar(font: Font, at: Vector2, w: float, name: String, v: int, mx: int, col: Color) -> void:
 		_text(font, name, at + Vector2(0, 18), 20, Color(0.85, 0.92, 1.0))
